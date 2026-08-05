@@ -13,8 +13,19 @@ pub struct RecoveryDraft {
 }
 
 fn recovery_dir() -> PathBuf {
-    let mut dir = std::env::temp_dir();
-    dir.push("textlume-recovery");
+    // 存到应用数据目录（%APPDATA%\textlume\recovery），比 temp 目录持久，
+    // 系统不会定期清理，崩溃后仍可恢复
+    let mut dir = if let Ok(appdata) = std::env::var("APPDATA") {
+        PathBuf::from(appdata)
+    } else if let Ok(home) = std::env::var("HOME") {
+        let mut h = PathBuf::from(home);
+        h.push(".config");
+        h
+    } else {
+        PathBuf::from(".")
+    };
+    dir.push("textlume");
+    dir.push("recovery");
     let _ = std::fs::create_dir_all(&dir);
     dir
 }
@@ -63,14 +74,7 @@ pub fn clear_recovery_draft(id: String) -> Result<(), String> {
     }
 }
 
-/// Public function that can be called from non-command contexts (e.g. window events)
-pub fn clear_all_recovery_drafts_internal() {
-    let dir = recovery_dir();
-    if dir.exists() {
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-}
-
+/// 清空所有草稿（当前仅用于测试/调试，前端不再调用）
 #[tauri::command]
 pub fn clear_all_recovery_drafts() -> Result<(), String> {
     let dir = recovery_dir();

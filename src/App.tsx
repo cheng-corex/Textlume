@@ -3,7 +3,7 @@ import { open, save } from "@tauri-apps/plugin-dialog";
 import { useDocumentStore } from "./stores/documentStore";
 import { useUIStore } from "./stores/uiStore";
 import { useFileTreeStore } from "./stores/fileTreeStore";
-import { openFile, saveFile, listDirectory, saveRecoveryDraft, listRecoveryDrafts, clearRecoveryDraft, clearAllRecoveryDrafts, addRecentFile, getRecentFiles, drainPendingFiles, getStartupFiles, saveSessionFiles, getSessionFiles } from "./lib/ipc";
+import { openFile, saveFile, listDirectory, saveRecoveryDraft, listRecoveryDrafts, clearRecoveryDraft, addRecentFile, getRecentFiles, drainPendingFiles, getStartupFiles, saveSessionFiles, getSessionFiles } from "./lib/ipc";
 import { detectLanguage, nextUntitledTitle } from "./core/documents/documentManager";
 import type { OpenDocument, TextEncoding, LineEnding } from "./core/documents/documentTypes";
 import AppLayout from "./components/layout/AppLayout";
@@ -233,10 +233,11 @@ export default function App() {
           try { await saveRecoveryDraft({ id: doc.id, path: doc.path, content: doc.content, encoding: doc.encoding, line_ending: doc.lineEnding, language_id: doc.languageId, saved_at: Date.now() }); }
           catch { /* noop */ }
         } else {
+          // 已保存的文件：清除草稿（如果之前有过恢复草稿）
           try { await clearRecoveryDraft(doc.id); } catch { /* noop */ }
         }
       }
-    }, 30000);
+    }, 5000);
     return () => clearInterval(iv);
   }, []);
 
@@ -245,7 +246,7 @@ export default function App() {
       try {
         const drafts = await listRecoveryDrafts();
         if (drafts.length > 0) {
-          for (const d of drafts.slice(0, 5)) {
+          for (const d of drafts) {
             const doc: OpenDocument = {
               id: d.id, path: d.path,
               // 有路径的用文件名，无路径的按"新文件 N"顺序编号，与新建文件不重名
@@ -257,9 +258,8 @@ export default function App() {
             };
             useDocumentStore.getState().openDocument(doc);
           }
-          // Immediately clear drafts from storage so they won't be restored again on next startup.
-          // The auto-save interval will re-save them as long as the documents remain dirty.
-          clearAllRecoveryDrafts().catch(() => {});
+          // 草稿保留在磁盘上；5 秒自动保存会持续更新它们，
+          // 直到用户显式保存（markSaved）或关闭标签（closeDocument）时删除对应草稿。
           useUIStore.getState().setStatusMessage(`已恢复 ${drafts.length} 个未保存文件`);
         }
       } catch { /* noop */ }
@@ -269,13 +269,6 @@ export default function App() {
   // Load recent files on startup
   useEffect(() => {
     getRecentFiles().then(setRecentFiles).catch(() => {});
-  }, []);
-
-  // Clear recovery drafts when app closes normally
-  useEffect(() => {
-    const handler = () => { clearAllRecoveryDrafts().catch(() => {}); };
-    window.addEventListener("beforeunload", handler);
-    return () => window.removeEventListener("beforeunload", handler);
   }, []);
 
   // Clear recovery draft when a document is closed

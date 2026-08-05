@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import type { DocumentId, OpenDocument, TextEncoding, LineEnding } from "../core/documents/documentTypes";
 import { createUntitledDocument, detectLanguage } from "../core/documents/documentManager";
+import { clearRecoveryDraft } from "../lib/ipc";
 
 interface DocumentState {
   documents: Map<DocumentId, OpenDocument>;
@@ -45,6 +46,8 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
   },
 
   closeDocument: (id) => {
+    // 用户明确关闭标签 = 放弃该文档内容，删除其恢复草稿
+    clearRecoveryDraft(id).catch(() => {});
     set((state) => {
       const docs = new Map(state.documents);
       docs.delete(id);
@@ -71,6 +74,8 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
   },
 
   markSaved: (id, path) => {
+    // 用户显式保存文件 = 内容已落盘，删除该文档的恢复草稿
+    clearRecoveryDraft(id).catch(() => {});
     set((state) => {
       const docs = new Map(state.documents);
       const doc = docs.get(id);

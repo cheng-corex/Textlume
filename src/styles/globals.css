@@ -573,16 +573,16 @@ body,
 }
 
 /* Light theme adjustments */
-.theme-light .markdown-body code {
+.theme-light-plus .markdown-body code {
   background: #f0f0f0;
 }
-.theme-light .markdown-body pre code {
+.theme-light-plus .markdown-body pre code {
   background: #f6f8fa;
 }
-.theme-light .code-block-header {
+.theme-light-plus .code-block-header {
   background: #f0f0f0;
 }
-.theme-light .copy-btn {
+.theme-light-plus .copy-btn {
   background: #fff;
 }
 .cm-editor.cm-focused {

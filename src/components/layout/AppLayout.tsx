@@ -1,8 +1,8 @@
 import { useState, useRef, useEffect, useMemo, useCallback } from "react";
 import { EditorView, keymap, placeholder, lineNumbers, highlightActiveLineGutter, rectangularSelection, scrollPastEnd } from "@codemirror/view";
-import { EditorState } from "@codemirror/state";
+import { EditorState, Compartment, type Extension } from "@codemirror/state";
 import { defaultKeymap, history, historyKeymap } from "@codemirror/commands";
-import { bracketMatching, indentOnInput, foldGutter, indentUnit } from "@codemirror/language";
+import { bracketMatching, indentOnInput, foldGutter, indentUnit, defaultHighlightStyle, syntaxHighlighting } from "@codemirror/language";
 import { closeBrackets, closeBracketsKeymap, completionKeymap, autocompletion } from "@codemirror/autocomplete";
 import { highlightSelectionMatches, searchKeymap } from "@codemirror/search";
 import { oneDark } from "@codemirror/theme-one-dark";
@@ -48,6 +48,15 @@ let clipboardIsCut: boolean = false;
 let dragJustEnded = false;
 // Module-level ref to the currently active CodeMirror EditorView for FindPanel
 let activeCMView: EditorView | null = null;
+
+// 浅色编辑主题（Light+ 使用）：CodeMirror 内置浅色语法高亮 + 跟随 CSS 变量
+const lightEditorTheme = [
+  syntaxHighlighting(defaultHighlightStyle),
+  EditorView.theme({
+    "&": { color: "var(--text-primary)", caretColor: "var(--accent)" },
+    ".cm-content": { color: "var(--text-primary)" },
+  }),
+] as Extension;
 
 interface Props { onNewFile: () => void; onOpenFile: () => void; onSaveFile: () => void; onOpenRecent: (path: string) => void; recentFiles: string[]; }
 
@@ -128,11 +137,11 @@ function TitleBar({ onNewFile, onOpenFile, onSaveFile, onOpenRecent, recentFiles
 
   return (
     <div ref={ref} style={{ height: 28, backgroundColor: "var(--title-bar)" }} className="flex items-center px-2 select-none flex-shrink-0">
-      <span className="text-[12px] font-medium mr-4" style={{ color: "#999" }}>Textlume</span>
+      <span className="text-[12px] font-medium mr-4" style={{ color: "var(--text-tertiary)" }}>Textlume</span>
       {["file","view","encoding","language","tools"].map((key) => (
         <div key={key} className="relative">
           <button onClick={() => setMenuOpen(menuOpen === key ? null : key)}
-            className="px-2 py-0.5 text-[11px]" style={{ color: menuOpen === key ? "#fff" : "#969696", backgroundColor: menuOpen === key ? "var(--bg-hover)" : "transparent" }}>
+            className="px-2 py-0.5 text-[11px]" style={{ color: menuOpen === key ? "var(--text-primary)" : "var(--text-tertiary)", backgroundColor: menuOpen === key ? "var(--bg-hover)" : "transparent" }}>
             {key === "file" ? "文件" : key === "view" ? "视图" : key === "encoding" ? "编码" : key === "language" ? "语言" : "工具"}
           </button>
           {menuOpen === key && (
@@ -204,7 +213,7 @@ function HelpMenu() {
   return (
     <div ref={ref} className="relative">
       <button onClick={() => setOpen(!open)} title="帮助"
-        className="flex items-center gap-0.5 px-2 py-0.5 text-[11px]" style={{ color: open ? "#fff" : "#969696", backgroundColor: open ? "var(--bg-hover)" : "transparent" }}>
+        className="flex items-center gap-0.5 px-2 py-0.5 text-[11px]" style={{ color: open ? "var(--text-primary)" : "var(--text-tertiary)", backgroundColor: open ? "var(--bg-hover)" : "transparent" }}>
         <HelpCircle size={12} />帮助
       </button>
       {open && (
@@ -375,7 +384,7 @@ function OpenFiles({ onNewFile }: { onNewFile: () => void }) {
           <div key={doc.id} onClick={() => { if (!isRenaming) setActive(doc.id); }}
             onContextMenu={(e) => fileCtx.show(e, menuItems)}
             className="flex items-center gap-2 px-3 py-1 text-[13px] cursor-pointer"
-            style={{ backgroundColor: act ? "var(--sidebar-active)" : "transparent", color: act ? "var(--sidebar-active-text)" : "#ccc" }}
+            style={{ backgroundColor: act ? "var(--sidebar-active)" : "transparent", color: act ? "var(--sidebar-active-text)" : "var(--text-secondary)" }}
             onMouseEnter={(e) => { if (!act) e.currentTarget.style.backgroundColor = "var(--sidebar-hover)"; }}
             onMouseLeave={(e) => { if (!act) e.currentTarget.style.backgroundColor = "transparent"; }}>
             <FileIcon languageId={doc.languageId} />
@@ -732,7 +741,7 @@ function FileTreeComp() {
           ];
           treeCtx.show(e, items);
         }}
-        className="flex items-center gap-1.5 px-3 py-0.5 cursor-pointer" style={{ color: "#ccc" }}
+        className="flex items-center gap-1.5 px-3 py-0.5 cursor-pointer" style={{ color: "var(--text-secondary)" }}
         onMouseEnter={(e) => e.currentTarget.style.backgroundColor = "var(--sidebar-hover)"}
         onMouseLeave={(e) => e.currentTarget.style.backgroundColor = "transparent"}>
         <span className="font-medium truncate">{root.split("\\").pop()?.split("/").pop()}</span>
@@ -968,7 +977,7 @@ function TN({ node, depth, expanded, gl, onToggle, refreshDir }: { node: any; de
           treeCtx.show(e, items);
         }}
         className="flex items-center gap-1 py-0.5 pr-2 cursor-pointer"
-        style={{ paddingLeft: `${depth * 12 + 8}px`, color: "#ccc", fontSize: 13, backgroundColor: isDragOver ? "var(--accent-muted)" : undefined, outline: isDragOver ? "1px dashed var(--accent)" : undefined }}
+        style={{ paddingLeft: `${depth * 12 + 8}px`, color: "var(--text-secondary)", fontSize: 13, backgroundColor: isDragOver ? "var(--accent-muted)" : undefined, outline: isDragOver ? "1px dashed var(--accent)" : undefined }}
         onMouseEnter={(e) => { if (!isDragOver) e.currentTarget.style.backgroundColor = "var(--sidebar-hover)"; }}
         onMouseLeave={(e) => { if (!isDragOver) e.currentTarget.style.backgroundColor = "transparent"; }}>
         {node.is_dir ? <span className="text-[10px] w-4 text-center" style={{ color: "var(--text-tertiary)" }}>{exp ? "\u25bc" : "\u25b6"}</span> : <span className="w-4" />}
@@ -1045,7 +1054,7 @@ function TabBar() {
             onMouseDown={(e) => { if (e.button === 1) { e.preventDefault(); closeDoc(doc.id); } }}
             onContextMenu={(e) => tabCtx.show(e, menuItems)}
             className="group flex items-center gap-1.5 px-2.5 cursor-pointer text-[13px] border-r select-none"
-            style={{ backgroundColor: act ? "var(--tab-active-bg)" : "var(--tab-inactive-bg)", color: act ? "#e8e8e8" : "#aaa", borderBottom: act ? "2px solid var(--tab-border)" : "2px solid transparent", borderRightColor: "var(--border)" }}>
+            style={{ backgroundColor: act ? "var(--tab-active-bg)" : "var(--tab-inactive-bg)", color: act ? "var(--text-primary)" : "var(--text-secondary)", borderBottom: act ? "2px solid var(--tab-border)" : "2px solid transparent", borderRightColor: "var(--border)" }}>
             <FileIcon languageId={doc.languageId} />
             {isRenaming ? (
               <input ref={renameRef} value={renameVal} onChange={(e) => setRenameVal(e.target.value)}
@@ -1058,7 +1067,7 @@ function TabBar() {
             )}
             {doc.isDirty && <span className="w-1.5 h-1.5 rounded-full" style={{ backgroundColor: "var(--yellow)" }} />}
             <button onClick={(e) => { e.stopPropagation(); closeDoc(doc.id); }}
-              className="opacity-0 group-hover:opacity-100 p-0.5 hover:bg-[rgba(255,255,255,0.1)]" style={{ color: "var(--text-tertiary)" }}>
+              className="opacity-0 group-hover:opacity-100 p-0.5 hover:bg-[var(--bg-hover)]" style={{ color: "var(--text-tertiary)" }}>
               <X size={11} />
             </button>
           </div>
@@ -1276,6 +1285,9 @@ function EditorInstance({ docId, onContextMenu }: { docId: string; onContextMenu
   const settings = useSettingsStore((s) => s.settings);
   const jumpTarget = useUIStore((s) => s.searchJumpTarget);
   const setJump = useUIStore((s) => s.setSearchJumpTarget);
+  const theme = useUIStore((s) => s.theme);
+  const isLight = theme === "light-plus";
+  const themeComp = useRef(new Compartment());
 
   // Use ref so the listener always calls the latest handler without re-subscribing
   const ctxRef = useRef(onContextMenu);
@@ -1317,7 +1329,7 @@ function EditorInstance({ docId, onContextMenu }: { docId: string; onContextMenu
           const line = upd.state.doc.lineAt(pos);
           setCursorPos(docId, line.number, pos - line.from + 1);
         }),
-        oneDark, ...(large ? [] : [lang?.() ?? []]).flat(),
+        themeComp.current.of(isLight ? lightEditorTheme : oneDark), ...(large ? [] : [lang?.() ?? []]).flat(),
         EditorView.editable.of(doc.mode !== "large-readonly" && !doc.isReadonly), placeholder(""),
         EditorView.theme({
           "&": { backgroundColor: "var(--bg-primary)" },
@@ -1355,6 +1367,13 @@ function EditorInstance({ docId, onContextMenu }: { docId: string; onContextMenu
     const cur = view.state.doc.toString();
     if (cur !== doc.content && !doc.isDirty) view.dispatch({ changes: { from: 0, to: cur.length, insert: doc.content } });
   }, [doc?.content, doc?.isDirty]);
+
+  // 切换主题时动态重配 CodeMirror 主题（保留撤销历史和光标位置）
+  useEffect(() => {
+    const view = viewRef.current;
+    if (!view) return;
+    view.dispatch({ effects: themeComp.current.reconfigure(isLight ? lightEditorTheme : oneDark) });
+  }, [isLight]);
 
   // 搜索结果跳转到指定行
   useEffect(() => {
@@ -1572,7 +1591,7 @@ function StatusBarComp() {
 
   return (
     <div ref={pickerRef} className="flex items-center justify-between h-[22px] px-3 text-[11px] flex-shrink-0 select-none"
-      style={{ backgroundColor: "var(--status-bar)", color: "var(--text-secondary)" }}>
+      style={{ backgroundColor: "var(--status-bar)", color: "var(--status-bar-text)" }}>
       <div className="flex items-center gap-3">
         {activeDoc ? (<>
           <span>行 {cursorPos?.line ?? 1}，列 {cursorPos?.col ?? 1}</span>

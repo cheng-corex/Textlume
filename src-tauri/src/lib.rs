@@ -40,11 +40,9 @@ pub fn run() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        .on_window_event(|_window, event| {
-            if let tauri::WindowEvent::CloseRequested { .. } = event {
-                commands::recovery::clear_all_recovery_drafts_internal();
-            }
-        })
+        // 注意：关闭窗口时不再清除恢复草稿！
+        // 草稿只在"用户明确保存文件"或"关闭单个标签"时删除，
+        // 崩溃或误关窗口后重新打开仍可恢复未保存内容。
         .invoke_handler(tauri::generate_handler![
             commands::file::open_file,
             commands::file::save_file,

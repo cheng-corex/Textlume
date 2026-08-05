@@ -4,7 +4,7 @@ import { useDocumentStore } from "./stores/documentStore";
 import { useUIStore } from "./stores/uiStore";
 import { useFileTreeStore } from "./stores/fileTreeStore";
 import { openFile, saveFile, listDirectory, saveRecoveryDraft, listRecoveryDrafts, clearRecoveryDraft, clearAllRecoveryDrafts, addRecentFile, getRecentFiles, drainPendingFiles, getStartupFiles, saveSessionFiles, getSessionFiles } from "./lib/ipc";
-import { detectLanguage } from "./core/documents/documentManager";
+import { detectLanguage, nextUntitledTitle } from "./core/documents/documentManager";
 import type { OpenDocument, TextEncoding, LineEnding } from "./core/documents/documentTypes";
 import AppLayout from "./components/layout/AppLayout";
 
@@ -248,7 +248,8 @@ export default function App() {
           for (const d of drafts.slice(0, 5)) {
             const doc: OpenDocument = {
               id: d.id, path: d.path,
-              title: d.path ? d.path.split("\\").pop()?.split("/").pop() ?? "恢复文件" : "恢复文件",
+              // 有路径的用文件名，无路径的按"新文件 N"顺序编号，与新建文件不重名
+              title: d.path ? d.path.split("\\").pop()?.split("/").pop() ?? nextUntitledTitle() : nextUntitledTitle(),
               content: d.content, encoding: (d.encoding as TextEncoding) ?? "utf-8",
               lineEnding: (d.line_ending as LineEnding) ?? "LF",
               languageId: d.language_id || "plaintext", mode: "normal-edit",

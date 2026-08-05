@@ -6,6 +6,15 @@ export function generateDocumentId(): DocumentId {
   return `doc_${nextId++}_${Date.now()}`;
 }
 
+/**
+ * 生成下一个未命名文件的标题（如"新文件 1"、"新文件 2"），
+ * 并递增内部计数器，确保与新建文件不重名。
+ * 用于恢复未保存的草稿时分配标题。
+ */
+export function nextUntitledTitle(): string {
+  return `新文件 ${nextId++}`;
+}
+
 export function createUntitledDocument(): OpenDocument {
   return {
     id: generateDocumentId(),

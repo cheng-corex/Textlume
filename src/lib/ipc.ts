@@ -11,6 +11,12 @@ export interface FileInfo {
   isReadonly: boolean;
 }
 
+export interface FileMetadata {
+  lastModifiedAt: number;
+  fileSize: number;
+  isReadonly: boolean;
+}
+
 export interface SavePayload {
   path: string;
   content: string;
@@ -22,7 +28,11 @@ export async function openFile(path: string): Promise<FileInfo> {
   return invoke<FileInfo>("open_file", { path });
 }
 
-export async function saveFile(payload: SavePayload): Promise<{ lastModifiedAt: number }> {
+export async function getFileMetadata(path: string): Promise<FileMetadata> {
+  return invoke<FileMetadata>("get_file_metadata", { path });
+}
+
+export async function saveFile(payload: SavePayload): Promise<{ lastModifiedAt: number; fileSize: number }> {
   return invoke("save_file", { payload });
 }
 
@@ -113,12 +123,38 @@ export async function getStartupFiles(): Promise<string[]> {
   return invoke<string[]>("get_startup_files");
 }
 
-export async function saveSessionFiles(paths: string[]): Promise<void> {
-  return invoke("save_session_files", { filePaths: paths });
+export interface SessionCursor {
+  line: number;
+  col: number;
 }
 
-export async function getSessionFiles(): Promise<string[]> {
-  return invoke<string[]>("get_session_files");
+export interface SessionSelection {
+  anchor: number;
+  head: number;
+}
+
+export interface SessionFile {
+  path: string;
+  pinned?: boolean;
+  encoding?: string;
+  line_ending?: string;
+  language_id?: string;
+  cursor?: SessionCursor;
+  selection?: SessionSelection;
+  scroll_top?: number;
+}
+
+export interface SessionData {
+  files: SessionFile[];
+  active_path?: string;
+}
+
+export async function saveSessionFiles(session: SessionData): Promise<void> {
+  return invoke("save_session_files", { session });
+}
+
+export async function getSessionFiles(): Promise<SessionData> {
+  return invoke<SessionData>("get_session_files");
 }
 
 export async function revealInExplorer(path: string): Promise<void> {

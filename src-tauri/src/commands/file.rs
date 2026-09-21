@@ -67,6 +67,13 @@ pub struct FileInfo {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct FileMetadata {
+    pub last_modified_at: u64,
+    pub file_size: u64,
+    pub is_readonly: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SavePayload {
     pub path: String,
@@ -78,6 +85,7 @@ pub struct SavePayload {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SaveResult {
     pub last_modified_at: u64,
+    pub file_size: u64,
 }
 
 /// Guess language from file extension
@@ -290,13 +298,15 @@ pub fn save_file(payload: SavePayload) -> Result<SaveResult, String> {
     std::fs::write(&temp_path, &final_bytes).map_err(|e| format!("保存失败: {}", e))?;
     std::fs::rename(&temp_path, &payload.path).map_err(|e| format!("保存失败: {}", e))?;
 
-    let last_modified_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    let saved_metadata = std::fs::metadata(&payload.path).map_err(|e| format!("保存失败: {}", e))?;
+    let last_modified_at = saved_metadata
+        .modified()
         .ok()
-        .map(|d| d.as_millis() as u64)
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0);
 
-    Ok(SaveResult { last_modified_at })
+    Ok(SaveResult { last_modified_at, file_size: saved_metadata.len() })
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -428,6 +438,63 @@ pub fn copy_file_or_dir(src_path: String, dest_dir: String) -> Result<String, St
     Ok(new_path.to_string_lossy().to_string())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_line_endings() {
+        assert_eq!(detect_line_ending(b"a\nb"), "LF");
+        assert_eq!(detect_line_ending(b"a\r\nb"), "CRLF");
+        assert_eq!(detect_line_ending(b"a\rb"), "CR");
+    }
+
+    #[test]
+    fn decodes_bom_and_utf8() {
+        assert_eq!(decode_content(b"hello"), ("hello".to_string(), "utf-8".to_string()));
+        assert_eq!(decode_content(&[0xEF, 0xBB, 0xBF, b'h']), ("h".to_string(), "utf-8-bom".to_string()));
+        assert_eq!(decode_content(&[0xFF, 0xFE, b'h', 0]), ("h".to_string(), "utf-16le".to_string()));
+    }
+
+    #[test]
+    fn guesses_common_languages() {
+        assert_eq!(guess_language("app.tsx"), "tsx");
+        assert_eq!(guess_language("README.MD"), "markdown");
+        assert_eq!(guess_language("unknown.custom"), "plaintext");
+    }
+
+    #[test]
+    fn saves_content_and_reports_size() {
+        let path = std::env::temp_dir().join(format!("textlume-file-test-{}.txt", std::process::id()));
+        let payload = SavePayload {
+            path: path.to_string_lossy().into_owned(),
+            content: "a\nb".to_string(),
+            encoding: "utf-8".to_string(),
+            line_ending: "CRLF".to_string(),
+        };
+        let result = save_file(payload).expect("save should succeed");
+        assert_eq!(std::fs::read(&path).expect("file should exist"), b"a\r\nb");
+        assert_eq!(result.file_size, 4);
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+#[tauri::command]
+pub fn get_file_metadata(path: String) -> Result<FileMetadata, String> {
+    let metadata = std::fs::metadata(&path).map_err(|e| e.to_string())?;
+    let last_modified_at = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0);
+    Ok(FileMetadata {
+        last_modified_at,
+        file_size: metadata.len(),
+        is_readonly: metadata.permissions().readonly(),
+    })
+}
+
 /// Move a file or directory into a target directory
 #[tauri::command]
 pub fn move_file_or_dir(src_path: String, dest_dir: String) -> Result<String, String> {
@@ -498,23 +565,72 @@ fn session_file_path() -> PathBuf {
     dir
 }
 
-/// Save the list of open file paths so they can be restored on next launch
+#[derive(Debug, serde::Serialize, serde::Deserialize, Default)]
+pub struct SessionCursor {
+    pub line: u32,
+    pub col: u32,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize, Default)]
+pub struct SessionSelection {
+    pub anchor: u64,
+    pub head: u64,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize, Default)]
+pub struct SessionFile {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoding: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_ending: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<SessionCursor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection: Option<SessionSelection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scroll_top: Option<f64>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize, Default)]
+pub struct SessionData {
+    #[serde(default)]
+    pub files: Vec<SessionFile>,
+    #[serde(default)]
+    pub active_path: Option<String>,
+}
+
+/// Save open files and their editor state so they can be restored on next launch
 #[tauri::command]
-pub fn save_session_files(file_paths: Vec<String>) -> Result<(), String> {
+pub fn save_session_files(session: SessionData) -> Result<(), String> {
     let session_path = session_file_path();
-    let json = serde_json::to_string(&file_paths).map_err(|e| e.to_string())?;
+    let json = serde_json::to_string(&session).map_err(|e| e.to_string())?;
     std::fs::write(&session_path, json).map_err(|e| e.to_string())
 }
 
-/// Get the list of previously open file paths for session restore
+/// Get previously open files and editor state for session restore.
+/// Older versions stored a plain string array, so keep that format readable.
 #[tauri::command]
-pub fn get_session_files() -> Vec<String> {
+pub fn get_session_files() -> SessionData {
     let session_path = session_file_path();
     if let Ok(content) = std::fs::read_to_string(&session_path) {
         let _ = std::fs::remove_file(&session_path);
-        serde_json::from_str(&content).unwrap_or_default()
+        if let Ok(session) = serde_json::from_str::<SessionData>(&content) {
+            return session;
+        }
+        if let Ok(file_paths) = serde_json::from_str::<Vec<String>>(&content) {
+            return SessionData {
+                files: file_paths.into_iter().map(|path| SessionFile { path, ..Default::default() }).collect(),
+                ..Default::default()
+            };
+        }
+        SessionData::default()
     } else {
-        Vec::new()
+        SessionData::default()
     }
 }
 

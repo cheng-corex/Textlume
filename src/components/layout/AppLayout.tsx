@@ -1,9 +1,9 @@
 import { useState, useRef, useEffect, useMemo, useCallback } from "react";
 import { EditorView, keymap, placeholder, lineNumbers, highlightActiveLineGutter, rectangularSelection, scrollPastEnd } from "@codemirror/view";
 import { EditorState, Compartment, type Extension } from "@codemirror/state";
-import { defaultKeymap, history, historyKeymap } from "@codemirror/commands";
+import { defaultKeymap, history, historyKeymap, addCursorAbove, addCursorBelow } from "@codemirror/commands";
 import { bracketMatching, indentOnInput, foldGutter, indentUnit, defaultHighlightStyle, syntaxHighlighting } from "@codemirror/language";
-import { closeBrackets, closeBracketsKeymap, completionKeymap, autocompletion } from "@codemirror/autocomplete";
+import { closeBrackets, closeBracketsKeymap, completionKeymap, autocompletion, completeAnyWord, completeFromList, snippetCompletion } from "@codemirror/autocomplete";
 import { highlightSelectionMatches, searchKeymap } from "@codemirror/search";
 import { oneDark } from "@codemirror/theme-one-dark";
 import { SearchQuery, setSearchQuery, findNext, findPrevious, replaceNext, replaceAll } from "@codemirror/search";
@@ -17,8 +17,9 @@ import { markdown } from "@codemirror/lang-markdown";
 import { xml } from "@codemirror/lang-xml";
 import { sql } from "@codemirror/lang-sql";
 import { yaml } from "@codemirror/lang-yaml";
-import { FileText, Settings, X, Search, FileSearch, Replace, HelpCircle } from "lucide-react";
+import { FileText, Settings, X, Search, FileSearch, Replace, HelpCircle, Pin } from "lucide-react";
 import { open as dialogOpen } from "@tauri-apps/plugin-dialog";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { marked } from "marked";
 import { markedHighlight } from "marked-highlight";
 import hljs from "highlight.js";
@@ -48,6 +49,52 @@ let clipboardIsCut: boolean = false;
 let dragJustEnded = false;
 // Module-level ref to the currently active CodeMirror EditorView for FindPanel
 let activeCMView: EditorView | null = null;
+let activeCMDocId: string | null = null;
+
+function goToEditorPosition(lineAndColumn?: string) {
+  if (!activeCMView) return;
+  const raw = lineAndColumn ?? window.prompt("跳转到行号或行号:列号", "1:1");
+  if (!raw) return;
+  const [lineText, colText] = raw.split(/[:,]/).map((part) => part.trim());
+  const lineNumber = Math.max(1, Number.parseInt(lineText, 10) || 1);
+  const columnNumber = Math.max(1, Number.parseInt(colText ?? "1", 10) || 1);
+  const line = activeCMView.state.doc.line(Math.min(lineNumber, activeCMView.state.doc.lines));
+  const pos = Math.min(line.from + columnNumber - 1, line.to);
+  activeCMView.dispatch({ selection: { anchor: pos, head: pos }, scrollIntoView: true });
+  activeCMView.focus();
+}
+
+function jumpBookmark(direction: 1 | -1) {
+  if (!activeCMView || !activeCMDocId) return;
+  const bookmarks = useUIStore.getState().bookmarks[activeCMDocId] ?? [];
+  if (!bookmarks.length) return;
+  const current = activeCMView.state.doc.lineAt(activeCMView.state.selection.main.head).number;
+  const next = direction > 0
+    ? bookmarks.find((line) => line > current) ?? bookmarks[0]
+    : [...bookmarks].reverse().find((line) => line < current) ?? bookmarks[bookmarks.length - 1];
+  const line = activeCMView.state.doc.line(Math.min(next, activeCMView.state.doc.lines));
+  activeCMView.dispatch({ selection: { anchor: line.from, head: line.from }, scrollIntoView: true });
+  activeCMView.focus();
+}
+
+function snippetList(languageId: string) {
+  const common = [
+    snippetCompletion("if (${condition}) {\n\t${body}\n}", { label: "if", type: "keyword", detail: "snippet" }),
+    snippetCompletion("for (const ${item} of ${items}) {\n\t${body}\n}", { label: "forof", type: "keyword", detail: "snippet" }),
+  ];
+  if (["python"].includes(languageId)) return [
+    snippetCompletion("def ${name}(${args}):\n\t${body}", { label: "def", type: "keyword", detail: "snippet" }),
+    snippetCompletion("if ${condition}:\n\t${body}", { label: "if", type: "keyword", detail: "snippet" }),
+  ];
+  if (["html", "xml"].includes(languageId)) return [
+    snippetCompletion("<${tag}>${content}</${tag}>", { label: "tag", type: "keyword", detail: "snippet" }),
+  ];
+  if (["rust"].includes(languageId)) return [
+    snippetCompletion("fn ${name}(${args}) {\n\t${body}\n}", { label: "fn", type: "keyword", detail: "snippet" }),
+    snippetCompletion("struct ${name} {\n\t${field}: ${type},\n}", { label: "struct", type: "class", detail: "snippet" }),
+  ];
+  return common;
+}
 
 // 浅色编辑主题（Light+ 使用）：CodeMirror 内置浅色语法高亮 + 跟随 CSS 变量
 const lightEditorTheme = [
@@ -68,6 +115,51 @@ export default function AppLayout({ onNewFile, onOpenFile, onSaveFile, onOpenRec
   const setSidebarView = useUIStore((s) => s.setSidebarView);
   const [settingsOpen, setSettingsOpen] = useState(false);
 
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.ctrlKey && event.shiftKey && event.key.toLowerCase() === "t") {
+        event.preventDefault();
+        const id = useDocumentStore.getState().reopenLastClosedDocument();
+        if (id) useUIStore.getState().setStatusMessage("已重新打开最近关闭的标签");
+      } else if (event.ctrlKey && !event.shiftKey && event.key === "Tab") {
+        event.preventDefault();
+        useDocumentStore.getState().switchToRecentDocument();
+      } else if (event.ctrlKey && !event.altKey && event.key.toLowerCase() === "g") {
+        event.preventDefault();
+        goToEditorPosition();
+      } else if (event.shiftKey && !event.ctrlKey && event.key === "F2") {
+        event.preventDefault();
+        jumpBookmark(-1);
+      } else if (event.ctrlKey && event.key === "F2") {
+        event.preventDefault();
+        jumpBookmark(1);
+      } else if (!event.ctrlKey && !event.shiftKey && event.key === "F2") {
+        if (!activeCMView || !activeCMDocId) return;
+        const line = activeCMView.state.doc.lineAt(activeCMView.state.selection.main.head).number;
+        useUIStore.getState().toggleBookmark(activeCMDocId, line);
+      } else if (event.ctrlKey && event.shiftKey && event.key.toLowerCase() === "o") {
+        event.preventDefault();
+        useUIStore.getState().toggleSymbolList();
+      } else if (event.ctrlKey && event.altKey && event.key.toLowerCase() === "m") {
+        event.preventDefault();
+        const state = useUIStore.getState();
+        state.setMacroRecording(!state.macroRecording);
+        state.setStatusMessage(state.macroRecording ? "宏录制已停止" : "宏录制已开始");
+      } else if (event.ctrlKey && event.altKey && event.key.toLowerCase() === "p") {
+        event.preventDefault();
+        const state = useUIStore.getState();
+        if (activeCMView && state.macroSteps.length) {
+          state.setMacroRecording(false);
+          for (const step of state.macroSteps) activeCMView.dispatch({ changes: step });
+          activeCMView.focus();
+          state.setStatusMessage(`宏已回放 ${state.macroSteps.length} 步`);
+        }
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
+
   return (
     <div className={`h-full flex flex-col theme-${theme}`} onContextMenu={(e) => e.preventDefault()}>
       <TitleBar onNewFile={onNewFile} onOpenFile={onOpenFile} onSaveFile={onSaveFile} onOpenRecent={onOpenRecent} recentFiles={recentFiles} />
@@ -85,7 +177,7 @@ export default function AppLayout({ onNewFile, onOpenFile, onSaveFile, onOpenRec
           </div>
         )}
         <div className="flex-1 flex flex-col min-w-0" style={{ backgroundColor: "var(--bg-primary)" }}>
-          <TabBar />
+          <TabBar onNewFile={onNewFile} />
           <EditorSection onNewFile={onNewFile} onOpenFile={onOpenFile} />
         </div>
       </div>
@@ -132,7 +224,7 @@ function TitleBar({ onNewFile, onOpenFile, onSaveFile, onOpenRecent, recentFiles
       onClick: () => { onOpenRecent(f); setMenuOpen(null); },
     })),
     { sep: "" },
-    { label: "退出", onClick: () => window.close() },
+    { label: "退出", onClick: () => { getCurrentWindow().close().catch(() => window.close()); } },
   ];
 
   return (
@@ -1012,21 +1104,22 @@ function TN({ node, depth, expanded, gl, onToggle, refreshDir }: { node: any; de
 }
 
 // ===== Tabs =====
-function TabBar() {
+function TabBar({ onNewFile }: { onNewFile: () => void }) {
   const docs = useDocumentStore((s) => s.documents);
   const activeId = useDocumentStore((s) => s.activeDocumentId);
   const setActive = useDocumentStore((s) => s.setActiveDocument);
   const closeDoc = useDocumentStore((s) => s.closeDocument);
   const renameDoc = useDocumentStore((s) => s.renameDocument);
+  const reorderDocs = useDocumentStore((s) => s.reorderDocuments);
+  const togglePinned = useDocumentStore((s) => s.togglePinned);
   const tabCtx = useContextMenu();
   const tabs = Array.from(docs.values());
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameVal, setRenameVal] = useState("");
   const renameRef = useRef<HTMLInputElement>(null);
+  const dragId = useRef<string | null>(null);
 
   useEffect(() => { if (renamingId && renameRef.current) { renameRef.current.focus(); renameRef.current.select(); } }, [renamingId]);
-  if (tabs.length === 0) return null;
-
   const closeOthers = (id: string) => { tabs.filter((t) => t.id !== id).forEach((t) => closeDoc(t.id)); };
   const closeRight = (id: string) => {
     const idx = tabs.findIndex((t) => t.id === id);
@@ -1036,7 +1129,12 @@ function TabBar() {
   const commitRename = () => { if (renamingId && renameVal.trim()) renameDoc(renamingId, renameVal.trim()); setRenamingId(null); };
 
   return (
-    <div className="flex h-8 items-stretch overflow-x-auto flex-shrink-0" style={{ backgroundColor: "var(--bg-secondary)" }}>
+    <div
+      className="flex h-8 items-stretch overflow-x-auto flex-shrink-0"
+      style={{ backgroundColor: "var(--bg-secondary)" }}
+      onDoubleClick={onNewFile}
+      title="双击空白处新建文件"
+    >
       {tabs.map((doc) => {
         const act = doc.id === activeId;
         const isRenaming = doc.id === renamingId;
@@ -1046,16 +1144,24 @@ function TabBar() {
           { label: "关闭右侧", onClick: () => closeRight(doc.id) },
           { label: "关闭所有", onClick: () => tabs.forEach((t) => closeDoc(t.id)) },
           { separator: true, label: "" },
+          { label: doc.isPinned ? "取消固定" : "固定标签", onClick: () => togglePinned(doc.id) },
           { label: "重命名", onClick: () => startRename(doc.id, doc.title) },
           { label: "复制路径", onClick: () => doc.path && navigator.clipboard.writeText(doc.path) },
         ];
         return (
-          <div key={doc.id} onClick={() => { if (!isRenaming) setActive(doc.id); }}
+          <div key={doc.id} draggable={!isRenaming}
+            onDragStart={() => { dragId.current = doc.id; }}
+            onDragOver={(e) => e.preventDefault()}
+            onDrop={(e) => { e.preventDefault(); if (dragId.current && dragId.current !== doc.id) reorderDocs(dragId.current, tabs.findIndex((t) => t.id === doc.id)); dragId.current = null; }}
+            onDragEnd={() => { dragId.current = null; }}
+            onClick={() => { if (!isRenaming) setActive(doc.id); }}
+            onDoubleClick={(e) => e.stopPropagation()}
             onMouseDown={(e) => { if (e.button === 1) { e.preventDefault(); closeDoc(doc.id); } }}
             onContextMenu={(e) => tabCtx.show(e, menuItems)}
             className="group flex items-center gap-1.5 px-2.5 cursor-pointer text-[13px] border-r select-none"
             style={{ backgroundColor: act ? "var(--tab-active-bg)" : "var(--tab-inactive-bg)", color: act ? "var(--text-primary)" : "var(--text-secondary)", borderBottom: act ? "2px solid var(--tab-border)" : "2px solid transparent", borderRightColor: "var(--border)" }}>
             <FileIcon languageId={doc.languageId} />
+            {doc.isPinned && <Pin size={10} style={{ color: "var(--accent)" }} />}
             {isRenaming ? (
               <input ref={renameRef} value={renameVal} onChange={(e) => setRenameVal(e.target.value)}
                 onBlur={commitRename} onKeyDown={(e) => { if (e.key === "Enter") commitRename(); if (e.key === "Escape") setRenamingId(null); }}
@@ -1063,7 +1169,7 @@ function TabBar() {
                 className="w-[90px] px-1 py-0 text-[13px] outline-none border rounded"
                 style={{ backgroundColor: "var(--input-bg)", color: "var(--text-primary)", borderColor: "var(--input-focus-border)" }} />
             ) : (
-              <span className="truncate max-w-[100px]">{doc.title}</span>
+              <span className="truncate max-w-[100px]" title={doc.path ?? doc.title}>{doc.title}</span>
             )}
             {doc.isDirty && <span className="w-1.5 h-1.5 rounded-full" style={{ backgroundColor: "var(--yellow)" }} />}
             <button onClick={(e) => { e.stopPropagation(); closeDoc(doc.id); }}
@@ -1168,6 +1274,8 @@ function EditorSection({ onNewFile, onOpenFile }: { onNewFile: () => void; onOpe
   const findPanelOpen = useUIStore((s) => s.findPanelOpen);
   const globalSearchOpen = useUIStore((s) => s.globalSearchOpen);
   const setGlobalSearchOpen = useUIStore((s) => s.setGlobalSearchOpen);
+  const symbolListOpen = useUIStore((s) => s.symbolListOpen);
+  const toggleSymbolList = useUIStore((s) => s.toggleSymbolList);
   const previewDocId = useUIStore((s) => s.previewDocId);
   const togglePreview = useUIStore((s) => s.togglePreview);
   const editorCtx = useContextMenu();
@@ -1251,6 +1359,7 @@ function EditorSection({ onNewFile, onOpenFile }: { onNewFile: () => void; onOpe
       {/* Floating search panels */}
       {findPanelOpen && <FindPanel />}
       {globalSearchOpen && <MultiSearch onClose={() => setGlobalSearchOpen(false)} />}
+      {symbolListOpen && activeDoc && <SymbolPanel doc={activeDoc} onClose={toggleSymbolList} />}
       <div className="flex-1 overflow-hidden" onContextMenu={(e) => editorCtx.show(e, editorMenu)}>
         {isPreview && activeDoc ? (
           <MarkdownPreview content={activeDoc.content} />
@@ -1268,6 +1377,48 @@ function EditorSection({ onNewFile, onOpenFile }: { onNewFile: () => void; onOpe
   );
 }
 
+function SymbolPanel({ doc, onClose }: { doc: OpenDocument; onClose: () => void }) {
+  const symbols = useMemo(() => {
+    const result: Array<{ label: string; line: number }> = [];
+    const patterns = [
+      /^\s*#{1,6}\s+(.+)/,
+      /^\s*(?:export\s+)?(?:async\s+)?function\s+([\w$]+)/,
+      /^\s*(?:export\s+)?class\s+([\w$]+)/,
+      /^\s*(?:def|fn|func)\s+([\w$]+)/,
+      /^\s*(?:const|let|var)\s+([\w$]+)\s*=\s*(?:async\s*)?\(/,
+    ];
+    doc.content.split(/\r?\n/).forEach((text, index) => {
+      for (const pattern of patterns) {
+        const match = text.match(pattern);
+        if (match) { result.push({ label: match[1].trim(), line: index + 1 }); break; }
+      }
+    });
+    return result;
+  }, [doc.content]);
+
+  const jump = (line: number) => {
+    if (activeCMView) {
+      const target = activeCMView.state.doc.line(Math.min(line, activeCMView.state.doc.lines));
+      activeCMView.dispatch({ selection: { anchor: target.from, head: target.from }, scrollIntoView: true });
+      activeCMView.focus();
+    }
+    onClose();
+  };
+
+  return (
+    <div className="absolute right-4 top-8 z-40 w-[280px] max-h-[60%] overflow-y-auto shadow-lg border rounded-md" style={{ backgroundColor: "var(--bg-surface)", borderColor: "var(--border)" }}>
+      <div className="flex items-center justify-between px-3 py-2 text-[12px] border-b" style={{ color: "var(--text-primary)", borderColor: "var(--border)" }}>
+        <span>符号列表</span><button onClick={onClose} style={{ color: "var(--text-tertiary)" }}>×</button>
+      </div>
+      {symbols.length === 0 ? <div className="px-3 py-3 text-[12px]" style={{ color: "var(--text-tertiary)" }}>未找到函数、类或标题</div> : symbols.map((symbol) => (
+        <button key={`${symbol.line}-${symbol.label}`} onClick={() => jump(symbol.line)} className="w-full flex items-center gap-2 px-3 py-1.5 text-left text-[12px] hover:bg-[var(--bg-hover)]" style={{ color: "var(--text-secondary)" }}>
+          <span className="flex-1 truncate">{symbol.label}</span><span style={{ color: "var(--text-tertiary)" }}>{symbol.line}</span>
+        </button>
+      ))}
+    </div>
+  );
+}
+
 const langMap: Record<string, () => any> = {
   javascript: () => javascript(), jsx: () => javascript({ jsx: true }),
   typescript: () => javascript({ typescript: true }), tsx: () => javascript({ jsx: true, typescript: true }),
@@ -1281,7 +1432,8 @@ function EditorInstance({ docId, onContextMenu }: { docId: string; onContextMenu
   const doc = useDocumentStore((s) => s.documents.get(docId));
   const updateContent = useDocumentStore((s) => s.updateContent);
   const setCursorPos = useUIStore((s) => s.setCursorPosition);
-  const clearCursorPos = useUIStore((s) => s.clearCursorPosition);
+  const setSelectionPos = useUIStore((s) => s.setSelectionPosition);
+  const setScrollPos = useUIStore((s) => s.setScrollPosition);
   const settings = useSettingsStore((s) => s.settings);
   const jumpTarget = useUIStore((s) => s.searchJumpTarget);
   const setJump = useUIStore((s) => s.setSearchJumpTarget);
@@ -1307,8 +1459,15 @@ function EditorInstance({ docId, onContextMenu }: { docId: string; onContextMenu
     if (!editorRef.current || !doc) return;
     const lang = langMap[doc.languageId];
     const large = doc.mode === "large-edit" || doc.mode === "large-readonly";
+    const savedSelection = useUIStore.getState().selectionPositions[docId];
+    const clampPosition = (position: number) => Math.max(0, Math.min(position, doc.content.length));
+    const initialSelection = savedSelection ? {
+      anchor: clampPosition(savedSelection.anchor),
+      head: clampPosition(savedSelection.head),
+    } : undefined;
     const state = EditorState.create({
       doc: doc.content,
+      selection: initialSelection,
       extensions: [
         ...(settings.showLineNumbers ? [lineNumbers()] : []),
         highlightActiveLineGutter(),
@@ -1318,16 +1477,33 @@ function EditorInstance({ docId, onContextMenu }: { docId: string; onContextMenu
         indentOnInput(), indentUnit.of(settings.insertSpaces ? " ".repeat(settings.tabSize) : "\t"),
         ...(settings.wordWrap ? [EditorView.lineWrapping] : []),
         keymap.of([...defaultKeymap, ...historyKeymap, ...searchKeymap, ...closeBracketsKeymap, ...completionKeymap]),
-        ...(!large ? [autocompletion()] : []), rectangularSelection(), highlightSelectionMatches(),
+        ...(!large ? [autocompletion({ override: [completeFromList(snippetList(doc.languageId)), completeAnyWord] })] : []),
+        keymap.of([
+          { key: "Ctrl-Alt-ArrowUp", run: addCursorAbove },
+          { key: "Ctrl-Alt-ArrowDown", run: addCursorBelow },
+        ]),
+        rectangularSelection(), highlightSelectionMatches(),
         scrollPastEnd(),
         EditorView.domEventHandlers({
           contextmenu(e: MouseEvent) { ctxRef.current?.(e); return true; },
         }),
         EditorView.updateListener.of((upd) => {
-          if (upd.docChanged) updateContent(docId, upd.state.doc.toString());
-          const pos = upd.state.selection.main.head;
-          const line = upd.state.doc.lineAt(pos);
-          setCursorPos(docId, line.number, pos - line.from + 1);
+          if (upd.docChanged) {
+            updateContent(docId, upd.state.doc.toString());
+            const macro = useUIStore.getState();
+            if (macro.macroRecording) {
+              upd.changes.iterChanges((fromA, toA, _fromB, _toB, inserted) => {
+                macro.addMacroStep({ from: fromA, to: toA, insert: inserted.toString() });
+              });
+            }
+          }
+          if (upd.docChanged || upd.selectionSet || upd.viewportChanged) {
+            const selection = upd.state.selection.main;
+            const line = upd.state.doc.lineAt(selection.head);
+            setCursorPos(docId, line.number, selection.head - line.from + 1);
+            setSelectionPos(docId, selection.anchor, selection.head);
+            setScrollPos(docId, upd.view.scrollDOM.scrollTop);
+          }
         }),
         themeComp.current.of(isLight ? lightEditorTheme : oneDark), ...(large ? [] : [lang?.() ?? []]).flat(),
         EditorView.editable.of(doc.mode !== "large-readonly" && !doc.isReadonly), placeholder(""),
@@ -1347,19 +1523,24 @@ function EditorInstance({ docId, onContextMenu }: { docId: string; onContextMenu
     });
     const view = new EditorView({ state, parent: editorRef.current });
     viewRef.current = view;
+    const savedScrollTop = useUIStore.getState().scrollPositions[docId];
+    if (savedScrollTop !== undefined) view.scrollDOM.scrollTop = Math.max(0, savedScrollTop);
     // Register as the active CodeMirror view for FindPanel
     activeCMView = view;
+    activeCMDocId = docId;
     // Report initial cursor position
     const pos = view.state.selection.main.head;
     const line = view.state.doc.lineAt(pos);
     setCursorPos(docId, line.number, pos - line.from + 1);
+    setSelectionPos(docId, view.state.selection.main.anchor, view.state.selection.main.head);
+    setScrollPos(docId, view.scrollDOM.scrollTop);
     return () => {
       if (activeCMView === view) activeCMView = null;
+      if (activeCMDocId === docId) activeCMDocId = null;
       view.destroy();
       viewRef.current = null;
-      clearCursorPos(docId);
     };
-  }, [docId, settings]);
+  }, [docId, settings, setCursorPos, setSelectionPos, setScrollPos, updateContent]);
 
   useEffect(() => {
     const view = viewRef.current;
@@ -1394,6 +1575,8 @@ function FindPanel() {
   const ft = useUIStore((s) => s.findText); const rt = useUIStore((s) => s.replaceText);
   const rm = useUIStore((s) => s.replaceMode); const sft = useUIStore((s) => s.setFindText);
   const srt = useUIStore((s) => s.setReplaceText); const cp = useUIStore((s) => s.closeFindPanel);
+  const findHistory = useUIStore((s) => s.findHistory); const replaceHistory = useUIStore((s) => s.replaceHistory);
+  const addFindHistory = useUIStore((s) => s.addFindHistory);
   const [cs, setCs] = useState(false); const [ww, setWw] = useState(false); const [rx, setRx] = useState(false);
   const ref = useRef<HTMLInputElement>(null);
   useEffect(() => { ref.current?.focus(); }, []);
@@ -1417,6 +1600,7 @@ function FindPanel() {
 
   const nav = (d: number) => {
     if (!activeCMView || !ft) return;
+    addFindHistory(ft, rt);
     activeCMView.dispatch({ effects: setSearchQuery.of(new SearchQuery({ search: ft, caseSensitive: cs, wholeWord: ww, regexp: rx })) });
     if (d > 0) findNext(activeCMView); else findPrevious(activeCMView);
   };
@@ -1424,14 +1608,16 @@ function FindPanel() {
     <div className="absolute left-4 right-4 top-8 z-40 shadow-lg border rounded-md animate-fade-in" style={{ backgroundColor: "var(--bg-surface)", borderColor: "var(--border)" }}>
       <div className="flex items-center gap-1.5 px-3 py-1.5">
         <div className="flex-1 flex flex-col gap-1">
-          <input ref={ref} value={ft} onChange={(e) => sft(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") nav(e.shiftKey ? -1 : 1); if (e.key === "Escape") closePanel(); }}
+          <input list="textlume-find-history" ref={ref} value={ft} onChange={(e) => sft(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") nav(e.shiftKey ? -1 : 1); if (e.key === "Escape") closePanel(); }}
             placeholder="查找" autoFocus className="px-2 py-1 text-[13px] outline-none border rounded"
             style={{ backgroundColor: "var(--input-bg)", color: "var(--text-primary)", borderColor: "var(--input-border)" }}
             onFocus={(e) => e.currentTarget.style.borderColor = "var(--input-focus-border)"} onBlur={(e) => e.currentTarget.style.borderColor = "var(--input-border)"} />
-          {rm && <input value={rt} onChange={(e) => srt(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") { if (activeCMView) replaceNext(activeCMView); } if (e.key === "Escape") closePanel(); }}
+          <datalist id="textlume-find-history">{findHistory.map((item) => <option key={item} value={item} />)}</datalist>
+          {rm && <input list="textlume-replace-history" value={rt} onChange={(e) => srt(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") { addFindHistory(ft, rt); if (activeCMView) replaceNext(activeCMView); } if (e.key === "Escape") closePanel(); }}
             placeholder="替换为" className="px-2 py-1 text-[13px] outline-none border rounded"
             style={{ backgroundColor: "var(--input-bg)", color: "var(--text-primary)", borderColor: "var(--input-border)" }}
             onFocus={(e) => e.currentTarget.style.borderColor = "var(--input-focus-border)"} onBlur={(e) => e.currentTarget.style.borderColor = "var(--input-border)"} />}
+          <datalist id="textlume-replace-history">{replaceHistory.map((item) => <option key={item} value={item} />)}</datalist>
         </div>
         <div className="flex items-center gap-0.5">
           <FBtn onClick={() => nav(-1)}>{'\u25b2'}</FBtn>

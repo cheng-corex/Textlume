@@ -3,6 +3,25 @@ import type { DocumentId, OpenDocument, TextEncoding, LineEnding } from "../core
 import { createUntitledDocument, detectLanguage } from "../core/documents/documentManager";
 import { clearRecoveryDraft } from "../lib/ipc";
 
+type CloseRequestHandler = (id: DocumentId) => void;
+let closeRequestHandler: CloseRequestHandler | null = null;
+const closedDocumentHistory: OpenDocument[] = [];
+let accessCounter = Date.now();
+
+interface ReloadedDocument {
+  content: string;
+  encoding: TextEncoding;
+  lineEnding: LineEnding;
+  languageId: string;
+  fileSize: number;
+  lastModifiedAt: number;
+  isReadonly: boolean;
+}
+
+export function setCloseRequestHandler(handler: CloseRequestHandler | null) {
+  closeRequestHandler = handler;
+}
+
 interface DocumentState {
   documents: Map<DocumentId, OpenDocument>;
   activeDocumentId: DocumentId | null;
@@ -10,12 +29,20 @@ interface DocumentState {
   createDocument: (content?: string, title?: string) => DocumentId;
   openDocument: (doc: OpenDocument) => void;
   closeDocument: (id: DocumentId) => void;
+  closeDocumentImmediately: (id: DocumentId) => void;
   setActiveDocument: (id: DocumentId) => void;
+  reorderDocuments: (id: DocumentId, targetIndex: number) => void;
+  togglePinned: (id: DocumentId) => void;
+  reopenLastClosedDocument: () => DocumentId | null;
+  switchToRecentDocument: () => void;
   updateContent: (id: DocumentId, content: string) => void;
-  markSaved: (id: DocumentId, path: string) => void;
-  setEncoding: (id: DocumentId, encoding: TextEncoding) => void;
-  setLineEnding: (id: DocumentId, lineEnding: LineEnding) => void;
+  markSaved: (id: DocumentId, path: string, lastModifiedAt?: number, fileSize?: number) => void;
+  setEncoding: (id: DocumentId, encoding: TextEncoding, markDirty?: boolean) => void;
+  setLineEnding: (id: DocumentId, lineEnding: LineEnding, markDirty?: boolean) => void;
   setLanguage: (id: DocumentId, languageId: string) => void;
+  reloadDocument: (id: DocumentId, file: ReloadedDocument) => void;
+  keepExternalFileChange: (id: DocumentId, lastModifiedAt: number, fileSize: number, isReadonly: boolean) => void;
+  updateFileMetadata: (id: DocumentId, lastModifiedAt: number, fileSize: number, isReadonly: boolean) => void;
   renameDocument: (id: DocumentId, title: string) => void;
   updateDocumentPath: (id: DocumentId, path: string) => void;
   getDocument: (id: DocumentId) => OpenDocument | undefined;
@@ -31,7 +58,7 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
     if (content) doc.content = content;
     set((state) => {
       const docs = new Map(state.documents);
-      docs.set(doc.id, doc);
+      docs.set(doc.id, { ...doc, lastAccessedAt: ++accessCounter });
       return { documents: docs, activeDocumentId: doc.id };
     });
     return doc.id;
@@ -40,16 +67,29 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
   openDocument: (doc) => {
     set((state) => {
       const docs = new Map(state.documents);
-      docs.set(doc.id, doc);
+      docs.set(doc.id, { ...doc, lastAccessedAt: ++accessCounter });
       return { documents: docs, activeDocumentId: doc.id };
     });
   },
 
   closeDocument: (id) => {
+    if (closeRequestHandler) {
+      closeRequestHandler(id);
+      return;
+    }
+    get().closeDocumentImmediately(id);
+  },
+
+  closeDocumentImmediately: (id) => {
     // 用户明确关闭标签 = 放弃该文档内容，删除其恢复草稿
     clearRecoveryDraft(id).catch(() => {});
     set((state) => {
       const docs = new Map(state.documents);
+      const closed = docs.get(id);
+      if (closed) {
+        closedDocumentHistory.push(closed);
+        if (closedDocumentHistory.length > 20) closedDocumentHistory.shift();
+      }
       docs.delete(id);
       let nextActive = state.activeDocumentId;
       if (state.activeDocumentId === id) {
@@ -60,7 +100,50 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
     });
   },
 
-  setActiveDocument: (id) => set({ activeDocumentId: id }),
+  setActiveDocument: (id) => set((state) => {
+    const docs = new Map(state.documents);
+    const doc = docs.get(id);
+    if (!doc) return state;
+    docs.set(id, { ...doc, lastAccessedAt: ++accessCounter });
+    return { documents: docs, activeDocumentId: id };
+  }),
+
+  reorderDocuments: (id, targetIndex) => set((state) => {
+    const entries = Array.from(state.documents.entries());
+    const sourceIndex = entries.findIndex(([docId]) => docId === id);
+    if (sourceIndex < 0) return state;
+    const [entry] = entries.splice(sourceIndex, 1);
+    const boundedIndex = Math.max(0, Math.min(targetIndex, entries.length));
+    entries.splice(boundedIndex, 0, entry);
+    return { documents: new Map(entries) };
+  }),
+
+  togglePinned: (id) => set((state) => {
+    const docs = new Map(state.documents);
+    const doc = docs.get(id);
+    if (doc) docs.set(id, { ...doc, isPinned: !doc.isPinned });
+    return { documents: docs };
+  }),
+
+  reopenLastClosedDocument: () => {
+    const doc = closedDocumentHistory.pop();
+    if (!doc) return null;
+    set((state) => {
+      const docs = new Map(state.documents);
+      docs.set(doc.id, { ...doc, lastAccessedAt: ++accessCounter });
+      return { documents: docs, activeDocumentId: doc.id };
+    });
+    return doc.id;
+  },
+
+  switchToRecentDocument: () => set((state) => {
+    const docs = Array.from(state.documents.values()).sort((a, b) => (b.lastAccessedAt ?? 0) - (a.lastAccessedAt ?? 0));
+    if (docs.length < 2) return state;
+    const next = docs[0].id === state.activeDocumentId ? docs[1] : docs[0];
+    const map = new Map(state.documents);
+    map.set(next.id, { ...next, lastAccessedAt: ++accessCounter });
+    return { documents: map, activeDocumentId: next.id };
+  }),
 
   updateContent: (id, content) => {
     set((state) => {
@@ -73,7 +156,7 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
     });
   },
 
-  markSaved: (id, path) => {
+  markSaved: (id, path, lastModifiedAt, fileSize) => {
     // 用户显式保存文件 = 内容已落盘，删除该文档的恢复草稿
     clearRecoveryDraft(id).catch(() => {});
     set((state) => {
@@ -90,8 +173,9 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
           title,
           isDirty: false,
           isUntitled: false,
-          lastSavedAt: Date.now(),
-          lastKnownModifiedAt: Date.now(),
+          fileSize: fileSize ?? doc.fileSize,
+          lastSavedAt: lastModifiedAt ?? Date.now(),
+          lastKnownModifiedAt: lastModifiedAt ?? Date.now(),
           languageId: detectLanguage(pathFileName),
         });
       }
@@ -99,20 +183,20 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
     });
   },
 
-  setEncoding: (id, encoding) => {
+  setEncoding: (id, encoding, markDirty = true) => {
     set((state) => {
       const docs = new Map(state.documents);
       const doc = docs.get(id);
-      if (doc) docs.set(id, { ...doc, encoding, isDirty: true });
+      if (doc) docs.set(id, { ...doc, encoding, isDirty: markDirty ? true : doc.isDirty });
       return { documents: docs };
     });
   },
 
-  setLineEnding: (id, lineEnding) => {
+  setLineEnding: (id, lineEnding, markDirty = true) => {
     set((state) => {
       const docs = new Map(state.documents);
       const doc = docs.get(id);
-      if (doc) docs.set(id, { ...doc, lineEnding, isDirty: true });
+      if (doc) docs.set(id, { ...doc, lineEnding, isDirty: markDirty ? true : doc.isDirty });
       return { documents: docs };
     });
   },
@@ -122,6 +206,48 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
       const docs = new Map(state.documents);
       const doc = docs.get(id);
       if (doc) docs.set(id, { ...doc, languageId });
+      return { documents: docs };
+    });
+  },
+
+  reloadDocument: (id, file) => {
+    set((state) => {
+      const docs = new Map(state.documents);
+      const doc = docs.get(id);
+      if (doc) {
+        docs.set(id, {
+          ...doc,
+          content: file.content,
+          encoding: file.encoding,
+          lineEnding: file.lineEnding,
+          languageId: file.languageId,
+          fileSize: file.fileSize,
+          isReadonly: file.isReadonly,
+          isDirty: false,
+          lastSavedAt: file.lastModifiedAt,
+          lastKnownModifiedAt: file.lastModifiedAt,
+        });
+      }
+      return { documents: docs };
+    });
+  },
+
+  keepExternalFileChange: (id, lastModifiedAt, fileSize, isReadonly) => {
+    set((state) => {
+      const docs = new Map(state.documents);
+      const doc = docs.get(id);
+      if (doc) {
+        docs.set(id, { ...doc, fileSize, isReadonly, lastKnownModifiedAt: lastModifiedAt, isDirty: true });
+      }
+      return { documents: docs };
+    });
+  },
+
+  updateFileMetadata: (id, lastModifiedAt, fileSize, isReadonly) => {
+    set((state) => {
+      const docs = new Map(state.documents);
+      const doc = docs.get(id);
+      if (doc) docs.set(id, { ...doc, fileSize, isReadonly, lastKnownModifiedAt: lastModifiedAt });
       return { documents: docs };
     });
   },

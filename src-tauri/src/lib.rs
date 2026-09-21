@@ -45,6 +45,7 @@ pub fn run() {
         // 崩溃或误关窗口后重新打开仍可恢复未保存内容。
         .invoke_handler(tauri::generate_handler![
             commands::file::open_file,
+            commands::file::get_file_metadata,
             commands::file::save_file,
             commands::file::list_directory,
             commands::file::rename_file,

@@ -30,6 +30,8 @@ export interface OpenDocument {
   isDirty: boolean;
   isReadonly: boolean;
   isUntitled: boolean;
+  isPinned?: boolean;
+  lastAccessedAt?: number;
   fileSize?: number;
   lastSavedAt?: number;
   lastKnownModifiedAt?: number;

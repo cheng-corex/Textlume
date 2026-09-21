@@ -31,7 +31,7 @@ interface UIState {
   replaceHistory: string[];
   bookmarks: Record<string, number[]>;
   macroRecording: boolean;
-  macroSteps: Array<{ from: number; to: number; insert: string }>;
+  macroSteps: Array<{ changes: Array<{ from: number; to: number; insert: string }> }>;
 
   setTheme: (theme: ThemeName) => void;
   toggleSidebar: () => void;
@@ -54,10 +54,23 @@ interface UIState {
   addFindHistory: (find: string, replace: string) => void;
   toggleBookmark: (docId: string, line: number) => void;
   clearBookmarks: (docId: string) => void;
+  stashDocumentState: (docId: string) => void;
+  restoreDocumentState: (docId: string) => void;
+  transferDocumentState: (fromDocId: string, toDocId: string) => void;
   setMacroRecording: (recording: boolean) => void;
-  addMacroStep: (step: { from: number; to: number; insert: string }) => void;
+  addMacroStep: (step: { changes: Array<{ from: number; to: number; insert: string }> }) => void;
   clearMacroSteps: () => void;
 }
+
+type DocumentViewState = {
+  cursor?: { line: number; col: number };
+  selection?: { anchor: number; head: number };
+  scrollTop?: number;
+  bookmarks?: number[];
+  preview: boolean;
+};
+
+const closedDocumentViewStates = new Map<string, DocumentViewState>();
 
 export const useUIStore = create<UIState>((set) => ({
   theme: "dark-plus",
@@ -121,6 +134,54 @@ export const useUIStore = create<UIState>((set) => ({
     const next = { ...s.bookmarks };
     delete next[docId];
     return { bookmarks: next };
+  }),
+  stashDocumentState: (docId) => set((s) => {
+    closedDocumentViewStates.delete(docId);
+    closedDocumentViewStates.set(docId, {
+      cursor: s.cursorPositions[docId],
+      selection: s.selectionPositions[docId],
+      scrollTop: s.scrollPositions[docId],
+      bookmarks: s.bookmarks[docId],
+      preview: s.previewDocId === docId,
+    });
+    while (closedDocumentViewStates.size > 20) {
+      const oldest = closedDocumentViewStates.keys().next().value;
+      if (oldest) closedDocumentViewStates.delete(oldest);
+      else break;
+    }
+    const cursorPositions = { ...s.cursorPositions };
+    const selectionPositions = { ...s.selectionPositions };
+    const scrollPositions = { ...s.scrollPositions };
+    const bookmarks = { ...s.bookmarks };
+    delete cursorPositions[docId];
+    delete selectionPositions[docId];
+    delete scrollPositions[docId];
+    delete bookmarks[docId];
+    return { cursorPositions, selectionPositions, scrollPositions, bookmarks, previewDocId: s.previewDocId === docId ? null : s.previewDocId };
+  }),
+  restoreDocumentState: (docId) => set((s) => {
+    const saved = closedDocumentViewStates.get(docId);
+    if (!saved) return s;
+    closedDocumentViewStates.delete(docId);
+    return {
+      cursorPositions: saved.cursor ? { ...s.cursorPositions, [docId]: saved.cursor } : s.cursorPositions,
+      selectionPositions: saved.selection ? { ...s.selectionPositions, [docId]: saved.selection } : s.selectionPositions,
+      scrollPositions: saved.scrollTop !== undefined ? { ...s.scrollPositions, [docId]: saved.scrollTop } : s.scrollPositions,
+      bookmarks: saved.bookmarks ? { ...s.bookmarks, [docId]: saved.bookmarks } : s.bookmarks,
+      previewDocId: saved.preview ? docId : s.previewDocId,
+    };
+  }),
+  transferDocumentState: (fromDocId, toDocId) => set((s) => {
+    const saved = closedDocumentViewStates.get(fromDocId);
+    if (!saved) return s;
+    closedDocumentViewStates.delete(fromDocId);
+    return {
+      cursorPositions: saved.cursor ? { ...s.cursorPositions, [toDocId]: saved.cursor } : s.cursorPositions,
+      selectionPositions: saved.selection ? { ...s.selectionPositions, [toDocId]: saved.selection } : s.selectionPositions,
+      scrollPositions: saved.scrollTop !== undefined ? { ...s.scrollPositions, [toDocId]: saved.scrollTop } : s.scrollPositions,
+      bookmarks: saved.bookmarks ? { ...s.bookmarks, [toDocId]: saved.bookmarks } : s.bookmarks,
+      previewDocId: saved.preview ? toDocId : s.previewDocId,
+    };
   }),
   setMacroRecording: (recording) => set({ macroRecording: recording, ...(recording ? { macroSteps: [] } : {}) }),
   addMacroStep: (step) => set((s) => s.macroRecording ? ({ macroSteps: [...s.macroSteps, step] }) : s),

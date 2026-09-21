@@ -24,8 +24,8 @@ export default function App() {
   const setStatusMessage = useUIStore((s) => s.setStatusMessage);
   const [recentFiles, setRecentFiles] = useState<string[]>([]);
   const [closeQueue, setCloseQueue] = useState<string[]>([]);
-  const [closingWindow, setClosingWindow] = useState(false);
   const recoveryFlushRef = useRef<(() => Promise<void>) | null>(null);
+  const sessionFlushRef = useRef<(() => Promise<void>) | null>(null);
   const [externalChange, setExternalChange] = useState<{ docId: string; metadata: FileMetadata } | null>(null);
   const [compareChange, setCompareChange] = useState<{ docId: string; file: FileInfo } | null>(null);
   const [fileStatusChange, setFileStatusChange] = useState<{ docId: string } | null>(null);
@@ -250,7 +250,6 @@ export default function App() {
     if (!id) return;
     if (action === "cancel") {
       setCloseQueue([]);
-      setClosingWindow(false);
       return;
     }
     if (action === "discard") {
@@ -264,7 +263,6 @@ export default function App() {
     } else {
       // 取消保存对话框或保存失败时，不继续处理批量关闭请求。
       setCloseQueue([]);
-      setClosingWindow(false);
     }
   }, [closeQueue, saveDocument]);
 
@@ -277,8 +275,8 @@ export default function App() {
       event.preventDefault();
       // 等待防抖/兜底队列完成，确保最后一秒内的编辑也已进入恢复草稿。
       await recoveryFlushRef.current?.();
+      await sessionFlushRef.current?.();
       setCloseQueue([]);
-      setClosingWindow(false);
       // destroy 不会重新触发 close-requested，避免在关闭事件中调用 close() 导致重入。
       await appWindow.destroy().catch((error) => {
         console.error("关闭应用失败:", error);
@@ -294,14 +292,6 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (!closingWindow || closeQueue.length > 0) return;
-    setClosingWindow(false);
-    getCurrentWindow().destroy().catch((error) => {
-      console.error("关闭应用失败:", error);
-    });
-  }, [closingWindow, closeQueue.length]);
-
-  useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       const mod = e.ctrlKey || e.metaKey;
       if (mod && e.key === "n") { e.preventDefault(); handleNewFile(); }
@@ -313,16 +303,6 @@ export default function App() {
       else if (mod && e.key === "f") { e.preventDefault(); useUIStore.getState().openFindPanel(false); }
       else if (mod && e.key === "h") { e.preventDefault(); useUIStore.getState().openFindPanel(true); }
       else if (e.key === "Escape") { const s = useUIStore.getState(); if (s.findPanelOpen) s.closeFindPanel(); }
-      else if (mod && e.key === "Tab") {
-        e.preventDefault();
-        const s = useDocumentStore.getState();
-        const ids = Array.from(s.documents.keys());
-        if (ids.length > 1) {
-          const idx = ids.indexOf(s.activeDocumentId!);
-          const next = e.shiftKey ? (idx <= 0 ? ids[ids.length - 1] : ids[idx - 1]) : (idx >= ids.length - 1 ? ids[0] : ids[idx + 1]);
-          s.setActiveDocument(next);
-        }
-      }
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
@@ -434,8 +414,14 @@ export default function App() {
   // Clear recovery draft when a document is closed
   useEffect(() => {
     const unsub = useDocumentStore.subscribe((state, prevState) => {
+      for (const id of state.documents.keys()) {
+        if (!prevState.documents.has(id)) {
+          useUIStore.getState().restoreDocumentState(id);
+        }
+      }
       for (const id of prevState.documents.keys()) {
         if (!state.documents.has(id)) {
+          useUIStore.getState().stashDocumentState(id);
           clearRecoveryDraft(id).catch(() => {});
         }
       }
@@ -446,10 +432,20 @@ export default function App() {
   // Save session when documents or editor view state changes.
   useEffect(() => {
     let timer: ReturnType<typeof setTimeout> | undefined;
+    let savePromise: Promise<void> = Promise.resolve();
     const saveSessionSnapshot = () => {
       const state = useDocumentStore.getState();
       const ui = useUIStore.getState();
-      const files = [];
+      const files: Array<{
+        path: string;
+        encoding: string;
+        line_ending: string;
+        language_id: string;
+        pinned: boolean | undefined;
+        cursor: { line: number; col: number } | undefined;
+        selection: { anchor: number; head: number } | undefined;
+        scroll_top: number | undefined;
+      }> = [];
       for (const doc of state.documents.values()) {
         if (doc.path && !doc.isUntitled) {
           files.push({
@@ -465,14 +461,23 @@ export default function App() {
         }
       }
       const activeDoc = state.activeDocumentId ? state.documents.get(state.activeDocumentId) : undefined;
-      saveSessionFiles({ files, active_path: activeDoc?.path }).catch(() => {});
+      savePromise = savePromise.catch(() => {}).then(() => saveSessionFiles({ files, active_path: activeDoc?.path }));
+      return savePromise;
     };
     const scheduleSave = () => {
       if (timer) clearTimeout(timer);
       timer = setTimeout(() => {
         timer = undefined;
-        saveSessionSnapshot();
+        void saveSessionSnapshot();
       }, 250);
+    };
+
+    sessionFlushRef.current = async () => {
+      if (timer) {
+        clearTimeout(timer);
+        timer = undefined;
+      }
+      await saveSessionSnapshot();
     };
 
     const unsubDocuments = useDocumentStore.subscribe(() => scheduleSave());
@@ -487,6 +492,7 @@ export default function App() {
       unsubDocuments();
       unsubEditorState();
       if (timer) clearTimeout(timer);
+      sessionFlushRef.current = null;
     };
   }, []);
 
@@ -536,10 +542,26 @@ export default function App() {
           if (existingId) {
             const store = useDocumentStore.getState();
             store.updateContent(existingId, d.content);
+            if (d.title !== undefined) store.setTitle(existingId, d.title);
             store.setEncoding(existingId, (d.encoding as TextEncoding) ?? "utf-8", false);
             store.setLineEnding(existingId, (d.line_ending as LineEnding) ?? "LF", false);
             if (d.language_id) store.setLanguage(existingId, d.language_id);
-            await clearRecoveryDraft(d.id).catch(() => {});
+            if (existingId !== d.id) {
+              const current = useDocumentStore.getState().documents.get(existingId);
+              await saveRecoveryDraft({
+                id: existingId,
+                path: d.path,
+                title: d.title ?? current?.title,
+                content: d.content,
+                encoding: (d.encoding as TextEncoding) ?? "utf-8",
+                line_ending: (d.line_ending as LineEnding) ?? "LF",
+                language_id: d.language_id || current?.languageId || "plaintext",
+                saved_at: d.saved_at,
+                tab_order: d.tab_order,
+                is_active: d.is_active,
+              });
+              await clearRecoveryDraft(d.id);
+            }
             if (d.tab_order !== undefined) restoredPositions.push({ id: existingId, order: d.tab_order });
             if (d.is_active) restoredActiveId = existingId;
           } else {

@@ -7,6 +7,7 @@ type CloseRequestHandler = (id: DocumentId) => void;
 let closeRequestHandler: CloseRequestHandler | null = null;
 const closedDocumentHistory: OpenDocument[] = [];
 let accessCounter = Date.now();
+const normalizePath = (path: string) => path.replace(/^\\\\\?\\/, "").replace(/\\/g, "/").toLowerCase();
 
 interface ReloadedDocument {
   content: string;
@@ -33,13 +34,15 @@ interface DocumentState {
   setActiveDocument: (id: DocumentId) => void;
   reorderDocuments: (id: DocumentId, targetIndex: number) => void;
   togglePinned: (id: DocumentId) => void;
-  reopenLastClosedDocument: () => DocumentId | null;
+  getLastClosedDocument: () => OpenDocument | null;
+  reopenLastClosedDocument: (replacement?: OpenDocument) => DocumentId | null;
   switchToRecentDocument: () => void;
   updateContent: (id: DocumentId, content: string) => void;
   markSaved: (id: DocumentId, path: string, lastModifiedAt?: number, fileSize?: number) => void;
   setEncoding: (id: DocumentId, encoding: TextEncoding, markDirty?: boolean) => void;
   setLineEnding: (id: DocumentId, lineEnding: LineEnding, markDirty?: boolean) => void;
   setLanguage: (id: DocumentId, languageId: string) => void;
+  setTitle: (id: DocumentId, title: string) => void;
   reloadDocument: (id: DocumentId, file: ReloadedDocument) => void;
   keepExternalFileChange: (id: DocumentId, lastModifiedAt: number, fileSize: number, isReadonly: boolean) => void;
   updateFileMetadata: (id: DocumentId, lastModifiedAt: number, fileSize: number, isReadonly: boolean) => void;
@@ -125,15 +128,28 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
     return { documents: docs };
   }),
 
-  reopenLastClosedDocument: () => {
+  getLastClosedDocument: () => closedDocumentHistory[closedDocumentHistory.length - 1] ?? null,
+
+  reopenLastClosedDocument: (replacement) => {
     const doc = closedDocumentHistory.pop();
     if (!doc) return null;
+    let reopenedId: DocumentId = replacement?.id ?? doc.id;
     set((state) => {
       const docs = new Map(state.documents);
-      docs.set(doc.id, { ...doc, lastAccessedAt: ++accessCounter });
-      return { documents: docs, activeDocumentId: doc.id };
+      const existing = doc.path
+        ? Array.from(docs.entries()).find(([, current]) => current.path && normalizePath(current.path) === normalizePath(doc.path!))
+        : undefined;
+      if (existing) {
+        const [existingId, existingDoc] = existing;
+        reopenedId = existingId;
+        docs.set(existingId, { ...existingDoc, lastAccessedAt: ++accessCounter });
+        return { documents: docs, activeDocumentId: existingId };
+      }
+      const reopened = replacement ?? doc;
+      docs.set(reopened.id, { ...reopened, lastAccessedAt: ++accessCounter });
+      return { documents: docs, activeDocumentId: reopened.id };
     });
-    return doc.id;
+    return reopenedId;
   },
 
   switchToRecentDocument: () => set((state) => {
@@ -206,6 +222,15 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
       const docs = new Map(state.documents);
       const doc = docs.get(id);
       if (doc) docs.set(id, { ...doc, languageId });
+      return { documents: docs };
+    });
+  },
+
+  setTitle: (id, title) => {
+    set((state) => {
+      const docs = new Map(state.documents);
+      const doc = docs.get(id);
+      if (doc) docs.set(id, { ...doc, title });
       return { documents: docs };
     });
   },

@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, useMemo, useCallback } from "react";
 import { EditorView, keymap, placeholder, lineNumbers, highlightActiveLineGutter, rectangularSelection, scrollPastEnd } from "@codemirror/view";
-import { EditorState, Compartment, type Extension } from "@codemirror/state";
+import { Annotation, EditorState, Compartment, type ChangeSpec, type Extension } from "@codemirror/state";
 import { defaultKeymap, history, historyKeymap, addCursorAbove, addCursorBelow } from "@codemirror/commands";
 import { bracketMatching, indentOnInput, foldGutter, indentUnit, defaultHighlightStyle, syntaxHighlighting } from "@codemirror/language";
 import { closeBrackets, closeBracketsKeymap, completionKeymap, autocompletion, completeAnyWord, completeFromList, snippetCompletion } from "@codemirror/autocomplete";
@@ -32,7 +32,7 @@ import type { TreeNode } from "../../stores/fileTreeStore";
 import { listDirectory, openFile, addRecentFile, createFile, createDirectory, deleteFileOrDir, renameFile, revealInExplorer, moveFileOrDir, copyFileOrDir } from "../../lib/ipc";
 import { detectLanguage } from "../../core/documents/documentManager";
 import * as textTools from "../../core/textTools";
-import type { OpenDocument } from "../../core/documents/documentTypes";
+import type { LineEnding, OpenDocument, TextEncoding } from "../../core/documents/documentTypes";
 import FileIcon, { FolderIcon, extToLang } from "../FileIcon";
 import { useContextMenu } from "../ContextMenu";
 import type { ContextMenuItem } from "../ContextMenu";
@@ -47,34 +47,53 @@ let clipboardPath: string | null = null;
 let clipboardIsCut: boolean = false;
 // Module-level flag: suppress click right after a drag (shared across all TN instances)
 let dragJustEnded = false;
+let reopeningClosedDocument = false;
 // Module-level ref to the currently active CodeMirror EditorView for FindPanel
+const editorViews = new Map<string, EditorView>();
 let activeCMView: EditorView | null = null;
 let activeCMDocId: string | null = null;
+let macroPlayback = false;
+const programmaticSync = Annotation.define<boolean>();
+
+function syncActiveEditorView(activeId: string | null) {
+  activeCMDocId = activeId;
+  activeCMView = activeId ? editorViews.get(activeId) ?? null : null;
+}
+
+function getActiveEditorView() {
+  const activeId = useDocumentStore.getState().activeDocumentId;
+  if (activeCMDocId !== activeId || (activeId && activeCMView !== editorViews.get(activeId))) {
+    syncActiveEditorView(activeId);
+  }
+  return activeCMView && activeCMDocId ? { view: activeCMView, docId: activeCMDocId } : null;
+}
 
 function goToEditorPosition(lineAndColumn?: string) {
-  if (!activeCMView) return;
+  const active = getActiveEditorView();
+  if (!active) return;
   const raw = lineAndColumn ?? window.prompt("跳转到行号或行号:列号", "1:1");
   if (!raw) return;
   const [lineText, colText] = raw.split(/[:,]/).map((part) => part.trim());
   const lineNumber = Math.max(1, Number.parseInt(lineText, 10) || 1);
   const columnNumber = Math.max(1, Number.parseInt(colText ?? "1", 10) || 1);
-  const line = activeCMView.state.doc.line(Math.min(lineNumber, activeCMView.state.doc.lines));
+  const line = active.view.state.doc.line(Math.min(lineNumber, active.view.state.doc.lines));
   const pos = Math.min(line.from + columnNumber - 1, line.to);
-  activeCMView.dispatch({ selection: { anchor: pos, head: pos }, scrollIntoView: true });
-  activeCMView.focus();
+  active.view.dispatch({ selection: { anchor: pos, head: pos }, scrollIntoView: true });
+  active.view.focus();
 }
 
 function jumpBookmark(direction: 1 | -1) {
-  if (!activeCMView || !activeCMDocId) return;
-  const bookmarks = useUIStore.getState().bookmarks[activeCMDocId] ?? [];
+  const active = getActiveEditorView();
+  if (!active) return;
+  const bookmarks = useUIStore.getState().bookmarks[active.docId] ?? [];
   if (!bookmarks.length) return;
-  const current = activeCMView.state.doc.lineAt(activeCMView.state.selection.main.head).number;
+  const current = active.view.state.doc.lineAt(active.view.state.selection.main.head).number;
   const next = direction > 0
     ? bookmarks.find((line) => line > current) ?? bookmarks[0]
     : [...bookmarks].reverse().find((line) => line < current) ?? bookmarks[bookmarks.length - 1];
-  const line = activeCMView.state.doc.line(Math.min(next, activeCMView.state.doc.lines));
-  activeCMView.dispatch({ selection: { anchor: line.from, head: line.from }, scrollIntoView: true });
-  activeCMView.focus();
+  const line = active.view.state.doc.line(Math.min(next, active.view.state.doc.lines));
+  active.view.dispatch({ selection: { anchor: line.from, head: line.from }, scrollIntoView: true });
+  active.view.focus();
 }
 
 function snippetList(languageId: string) {
@@ -119,8 +138,46 @@ export default function AppLayout({ onNewFile, onOpenFile, onSaveFile, onOpenRec
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.ctrlKey && event.shiftKey && event.key.toLowerCase() === "t") {
         event.preventDefault();
-        const id = useDocumentStore.getState().reopenLastClosedDocument();
-        if (id) useUIStore.getState().setStatusMessage("已重新打开最近关闭的标签");
+        if (reopeningClosedDocument) return;
+        reopeningClosedDocument = true;
+        void (async () => {
+          try {
+            const store = useDocumentStore.getState();
+            const closed = store.getLastClosedDocument();
+            if (!closed) return;
+
+            let replacement: OpenDocument | undefined;
+            if (!closed.isDirty && closed.path) {
+              try {
+                const file = await openFile(closed.path);
+                replacement = {
+                  ...closed,
+                  path: file.path,
+                  content: file.content,
+                  encoding: file.encoding as TextEncoding,
+                  lineEnding: file.lineEnding as LineEnding,
+                  languageId: file.languageId || closed.languageId,
+                  fileSize: file.fileSize,
+                  lastSavedAt: file.lastModifiedAt,
+                  lastKnownModifiedAt: file.lastModifiedAt,
+                  isDirty: false,
+                  isReadonly: file.isReadonly,
+                  isUntitled: false,
+                };
+              } catch {
+                // If the clean file is unavailable, retain the closed snapshot as a fallback.
+              }
+            }
+
+            const id = store.reopenLastClosedDocument(replacement);
+            if (id) {
+              if (id !== closed.id) useUIStore.getState().transferDocumentState(closed.id, id);
+              useUIStore.getState().setStatusMessage("已重新打开最近关闭的标签");
+            }
+          } finally {
+            reopeningClosedDocument = false;
+          }
+        })();
       } else if (event.ctrlKey && !event.shiftKey && event.key === "Tab") {
         event.preventDefault();
         useDocumentStore.getState().switchToRecentDocument();
@@ -134,9 +191,10 @@ export default function AppLayout({ onNewFile, onOpenFile, onSaveFile, onOpenRec
         event.preventDefault();
         jumpBookmark(1);
       } else if (!event.ctrlKey && !event.shiftKey && event.key === "F2") {
-        if (!activeCMView || !activeCMDocId) return;
-        const line = activeCMView.state.doc.lineAt(activeCMView.state.selection.main.head).number;
-        useUIStore.getState().toggleBookmark(activeCMDocId, line);
+        const active = getActiveEditorView();
+        if (!active) return;
+        const line = active.view.state.doc.lineAt(active.view.state.selection.main.head).number;
+        useUIStore.getState().toggleBookmark(active.docId, line);
       } else if (event.ctrlKey && event.shiftKey && event.key.toLowerCase() === "o") {
         event.preventDefault();
         useUIStore.getState().toggleSymbolList();
@@ -148,11 +206,34 @@ export default function AppLayout({ onNewFile, onOpenFile, onSaveFile, onOpenRec
       } else if (event.ctrlKey && event.altKey && event.key.toLowerCase() === "p") {
         event.preventDefault();
         const state = useUIStore.getState();
-        if (activeCMView && state.macroSteps.length) {
+        const active = getActiveEditorView();
+        const steps = state.macroSteps;
+        if (active && steps.length) {
           state.setMacroRecording(false);
-          for (const step of state.macroSteps) activeCMView.dispatch({ changes: step });
-          activeCMView.focus();
-          state.setStatusMessage(`宏已回放 ${state.macroSteps.length} 步`);
+          let applied = 0;
+          macroPlayback = true;
+          try {
+            for (const step of steps) {
+              const length = active.view.state.doc.length;
+              const invalid = step.changes.some(({ from, to }) =>
+                !Number.isInteger(from) || !Number.isInteger(to) || from < 0 || from > to || to > length);
+              if (invalid) {
+                state.setStatusMessage("宏回放已中止：变更位置超出当前文档范围");
+                break;
+              }
+              try {
+                active.view.dispatch({ changes: step.changes as ChangeSpec[] });
+                applied += 1;
+              } catch {
+                state.setStatusMessage("宏回放已中止：变更无法应用");
+                break;
+              }
+            }
+          } finally {
+            macroPlayback = false;
+          }
+          active.view.focus();
+          if (applied === steps.length) state.setStatusMessage(`宏已回放 ${applied} 步`);
         }
       }
     };
@@ -1284,6 +1365,10 @@ function EditorSection({ onNewFile, onOpenFile }: { onNewFile: () => void; onOpe
   const isMd = activeDoc?.languageId === "markdown" || activeDoc?.path?.toLowerCase().endsWith(".md");
   const isPreview = activeId ? previewDocId === activeId : false;
 
+  useEffect(() => {
+    syncActiveEditorView(activeId);
+  }, [activeId, docs]);
+
   if (docs.size === 0) {
     return (
       <>
@@ -1397,10 +1482,11 @@ function SymbolPanel({ doc, onClose }: { doc: OpenDocument; onClose: () => void 
   }, [doc.content]);
 
   const jump = (line: number) => {
-    if (activeCMView) {
-      const target = activeCMView.state.doc.line(Math.min(line, activeCMView.state.doc.lines));
-      activeCMView.dispatch({ selection: { anchor: target.from, head: target.from }, scrollIntoView: true });
-      activeCMView.focus();
+    const active = getActiveEditorView();
+    if (active) {
+      const target = active.view.state.doc.line(Math.min(line, active.view.state.doc.lines));
+      active.view.dispatch({ selection: { anchor: target.from, head: target.from }, scrollIntoView: true });
+      active.view.focus();
     }
     onClose();
   };
@@ -1489,12 +1575,17 @@ function EditorInstance({ docId, onContextMenu }: { docId: string; onContextMenu
         }),
         EditorView.updateListener.of((upd) => {
           if (upd.docChanged) {
-            updateContent(docId, upd.state.doc.toString());
-            const macro = useUIStore.getState();
-            if (macro.macroRecording) {
-              upd.changes.iterChanges((fromA, toA, _fromB, _toB, inserted) => {
-                macro.addMacroStep({ from: fromA, to: toA, insert: inserted.toString() });
-              });
+            const isProgrammaticSync = upd.transactions.some((transaction) => transaction.annotation(programmaticSync));
+            if (!isProgrammaticSync) {
+              updateContent(docId, upd.state.doc.toString());
+              const macro = useUIStore.getState();
+              if (macro.macroRecording && !macroPlayback) {
+                const changes: Array<{ from: number; to: number; insert: string }> = [];
+                upd.changes.iterChanges((fromA, toA, _fromB, _toB, inserted) => {
+                  changes.push({ from: fromA, to: toA, insert: inserted.toString() });
+                });
+                if (changes.length) macro.addMacroStep({ changes });
+              }
             }
           }
           if (upd.docChanged || upd.selectionSet || upd.viewportChanged) {
@@ -1523,11 +1614,11 @@ function EditorInstance({ docId, onContextMenu }: { docId: string; onContextMenu
     });
     const view = new EditorView({ state, parent: editorRef.current });
     viewRef.current = view;
+    editorViews.set(docId, view);
     const savedScrollTop = useUIStore.getState().scrollPositions[docId];
     if (savedScrollTop !== undefined) view.scrollDOM.scrollTop = Math.max(0, savedScrollTop);
-    // Register as the active CodeMirror view for FindPanel
-    activeCMView = view;
-    activeCMDocId = docId;
+    // Keep the module-level active view tied to the document store, not mount order.
+    if (useDocumentStore.getState().activeDocumentId === docId) syncActiveEditorView(docId);
     // Report initial cursor position
     const pos = view.state.selection.main.head;
     const line = view.state.doc.lineAt(pos);
@@ -1535,8 +1626,8 @@ function EditorInstance({ docId, onContextMenu }: { docId: string; onContextMenu
     setSelectionPos(docId, view.state.selection.main.anchor, view.state.selection.main.head);
     setScrollPos(docId, view.scrollDOM.scrollTop);
     return () => {
-      if (activeCMView === view) activeCMView = null;
-      if (activeCMDocId === docId) activeCMDocId = null;
+      editorViews.delete(docId);
+      if (activeCMDocId === docId) syncActiveEditorView(useDocumentStore.getState().activeDocumentId);
       view.destroy();
       viewRef.current = null;
     };
@@ -1546,7 +1637,12 @@ function EditorInstance({ docId, onContextMenu }: { docId: string; onContextMenu
     const view = viewRef.current;
     if (!view || !doc) return;
     const cur = view.state.doc.toString();
-    if (cur !== doc.content) view.dispatch({ changes: { from: 0, to: cur.length, insert: doc.content } });
+    if (cur !== doc.content) {
+      view.dispatch({
+        changes: { from: 0, to: cur.length, insert: doc.content },
+        annotations: programmaticSync.of(true),
+      });
+    }
   }, [doc?.content, doc?.isDirty]);
 
   // 切换主题时动态重配 CodeMirror 主题（保留撤销历史和光标位置）
@@ -1583,26 +1679,29 @@ function FindPanel() {
 
   // 关闭面板时清除搜索高亮
   const closePanel = () => {
-    if (activeCMView) activeCMView.dispatch({ effects: setSearchQuery.of(new SearchQuery({ search: "" })) });
+    const active = getActiveEditorView();
+    if (active) active.view.dispatch({ effects: setSearchQuery.of(new SearchQuery({ search: "" })) });
     cp();
   };
 
   // 实时搜索：每次输入变化自动触发
   const doNav = useCallback((dir: number) => {
-    if (!activeCMView || !ft) return;
-    activeCMView.dispatch({ effects: setSearchQuery.of(new SearchQuery({ search: ft, caseSensitive: cs, wholeWord: ww, regexp: rx })) });
-    if (dir > 0) findNext(activeCMView);
-    else if (dir < 0) findPrevious(activeCMView);
+    const active = getActiveEditorView();
+    if (!active || !ft) return;
+    active.view.dispatch({ effects: setSearchQuery.of(new SearchQuery({ search: ft, caseSensitive: cs, wholeWord: ww, regexp: rx })) });
+    if (dir > 0) findNext(active.view);
+    else if (dir < 0) findPrevious(active.view);
   }, [ft, cs, ww, rx]);
 
   // 内容/选项变化时自动触发首次搜索
   useEffect(() => { doNav(1); }, [ft, cs, ww, rx, doNav]);
 
   const nav = (d: number) => {
-    if (!activeCMView || !ft) return;
+    const active = getActiveEditorView();
+    if (!active || !ft) return;
     addFindHistory(ft, rt);
-    activeCMView.dispatch({ effects: setSearchQuery.of(new SearchQuery({ search: ft, caseSensitive: cs, wholeWord: ww, regexp: rx })) });
-    if (d > 0) findNext(activeCMView); else findPrevious(activeCMView);
+    active.view.dispatch({ effects: setSearchQuery.of(new SearchQuery({ search: ft, caseSensitive: cs, wholeWord: ww, regexp: rx })) });
+    if (d > 0) findNext(active.view); else findPrevious(active.view);
   };
   return (
     <div className="absolute left-4 right-4 top-8 z-40 shadow-lg border rounded-md animate-fade-in" style={{ backgroundColor: "var(--bg-surface)", borderColor: "var(--border)" }}>
@@ -1613,7 +1712,7 @@ function FindPanel() {
             style={{ backgroundColor: "var(--input-bg)", color: "var(--text-primary)", borderColor: "var(--input-border)" }}
             onFocus={(e) => e.currentTarget.style.borderColor = "var(--input-focus-border)"} onBlur={(e) => e.currentTarget.style.borderColor = "var(--input-border)"} />
           <datalist id="textlume-find-history">{findHistory.map((item) => <option key={item} value={item} />)}</datalist>
-          {rm && <input list="textlume-replace-history" value={rt} onChange={(e) => srt(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") { addFindHistory(ft, rt); if (activeCMView) replaceNext(activeCMView); } if (e.key === "Escape") closePanel(); }}
+          {rm && <input list="textlume-replace-history" value={rt} onChange={(e) => srt(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") { addFindHistory(ft, rt); const active = getActiveEditorView(); if (active) replaceNext(active.view); } if (e.key === "Escape") closePanel(); }}
             placeholder="替换为" className="px-2 py-1 text-[13px] outline-none border rounded"
             style={{ backgroundColor: "var(--input-bg)", color: "var(--text-primary)", borderColor: "var(--input-border)" }}
             onFocus={(e) => e.currentTarget.style.borderColor = "var(--input-focus-border)"} onBlur={(e) => e.currentTarget.style.borderColor = "var(--input-border)"} />}
@@ -1622,7 +1721,7 @@ function FindPanel() {
         <div className="flex items-center gap-0.5">
           <FBtn onClick={() => nav(-1)}>{'\u25b2'}</FBtn>
           <FBtn onClick={() => nav(1)}>{'\u25bc'}</FBtn>
-          {rm && <><FBtn onClick={() => { if (activeCMView) replaceNext(activeCMView); }}>替换</FBtn><FBtn onClick={() => { if (activeCMView) replaceAll(activeCMView); }}>全部</FBtn></>}
+          {rm && <><FBtn onClick={() => { const active = getActiveEditorView(); if (active) replaceNext(active.view); }}>替换</FBtn><FBtn onClick={() => { const active = getActiveEditorView(); if (active) replaceAll(active.view); }}>全部</FBtn></>}
           <div className="w-px h-4 mx-0.5" style={{ backgroundColor: "var(--border)" }} />
           <FBtn active={cs} onClick={() => setCs((v) => !v)}>Aa</FBtn>
           <FBtn active={ww} onClick={() => setWw((v) => !v)}>W</FBtn>

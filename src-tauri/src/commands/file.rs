@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
 use std::path::Path;
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 fn recent_files_path() -> PathBuf {
     let mut dir = dirs_next().unwrap_or_else(|| PathBuf::from("."));
@@ -565,6 +568,100 @@ fn session_file_path() -> PathBuf {
     dir
 }
 
+fn session_temp_path(file_path: &Path) -> PathBuf {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let process_id = std::process::id();
+    let file_name = file_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("session.json");
+    file_path.with_file_name(format!(".{file_name}.{process_id}.{stamp}.tmp"))
+}
+
+fn atomic_replace_session(temp_path: &Path, file_path: &Path) -> io::Result<()> {
+    #[cfg(not(windows))]
+    {
+        fs::rename(temp_path, file_path)
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use std::ptr::{null, null_mut};
+
+        const REPLACEFILE_WRITE_THROUGH: u32 = 0x00000001;
+        const MOVEFILE_WRITE_THROUGH: u32 = 0x00000008;
+
+        fn wide_path(path: &Path) -> Vec<u16> {
+            path.as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect()
+        }
+
+        let temp_wide = wide_path(temp_path);
+        let file_wide = wide_path(file_path);
+        let replaced = unsafe {
+            if file_path.exists() {
+                ReplaceFileW(
+                    file_wide.as_ptr(),
+                    temp_wide.as_ptr(),
+                    null(),
+                    REPLACEFILE_WRITE_THROUGH,
+                    null_mut(),
+                    null_mut(),
+                )
+            } else {
+                MoveFileExW(
+                    temp_wide.as_ptr(),
+                    file_wide.as_ptr(),
+                    MOVEFILE_WRITE_THROUGH,
+                )
+            }
+        };
+        if replaced == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn MoveFileExW(existing_file_name: *const u16, new_file_name: *const u16, flags: u32) -> i32;
+    fn ReplaceFileW(
+        replaced_file_name: *const u16,
+        replacement_file_name: *const u16,
+        backup_file_name: *const u16,
+        replace_flags: u32,
+        exclude: *mut std::ffi::c_void,
+        reserved: *mut std::ffi::c_void,
+    ) -> i32;
+}
+
+fn atomic_write_session(file_path: &Path, contents: &str) -> io::Result<()> {
+    let temp_path = session_temp_path(file_path);
+    let result = (|| {
+        let mut temp_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)?;
+        temp_file.write_all(contents.as_bytes())?;
+        temp_file.sync_all()?;
+        drop(temp_file);
+        atomic_replace_session(&temp_path, file_path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result
+}
+
 #[derive(Debug, serde::Serialize, serde::Deserialize, Default)]
 pub struct SessionCursor {
     pub line: u32,
@@ -609,7 +706,7 @@ pub struct SessionData {
 pub fn save_session_files(session: SessionData) -> Result<(), String> {
     let session_path = session_file_path();
     let json = serde_json::to_string(&session).map_err(|e| e.to_string())?;
-    std::fs::write(&session_path, json).map_err(|e| e.to_string())
+    atomic_write_session(&session_path, &json).map_err(|e| e.to_string())
 }
 
 /// Get previously open files and editor state for session restore.

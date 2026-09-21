@@ -76,11 +76,14 @@ export async function listDirectory(path: string): Promise<DirEntry[]> {
 export interface RecoveryDraft {
   id: string;
   path?: string;
+  title?: string;
   content: string;
   encoding: string;
   line_ending: string;
   language_id: string;
   saved_at: number;
+  tab_order?: number;
+  is_active?: boolean;
 }
 
 export async function saveRecoveryDraft(draft: RecoveryDraft): Promise<void> {

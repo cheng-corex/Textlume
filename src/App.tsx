@@ -5,7 +5,7 @@ import { setCloseRequestHandler, useDocumentStore } from "./stores/documentStore
 import { useUIStore } from "./stores/uiStore";
 import { useFileTreeStore } from "./stores/fileTreeStore";
 import { openFile, getFileMetadata, saveFile, listDirectory, saveRecoveryDraft, listRecoveryDrafts, clearRecoveryDraft, addRecentFile, getRecentFiles, drainPendingFiles, getStartupFiles, saveSessionFiles, getSessionFiles, type FileInfo, type FileMetadata } from "./lib/ipc";
-import { detectLanguage, nextUntitledTitle } from "./core/documents/documentManager";
+import { detectLanguage, nextUntitledTitle, reserveUntitledTitle, untitledTitleFromDocumentId } from "./core/documents/documentManager";
 import type { OpenDocument, TextEncoding, LineEnding } from "./core/documents/documentTypes";
 import AppLayout from "./components/layout/AppLayout";
 
@@ -268,25 +268,21 @@ export default function App() {
     }
   }, [closeQueue, saveDocument]);
 
-  // 关闭窗口时复用标签关闭确认，所有未保存文档处理完才真正退出。
+  // 关闭窗口时直接退出：先把未保存内容写入恢复草稿，下一次启动继续恢复。
   useEffect(() => {
     const appWindow = getCurrentWindow();
     let unlisten: (() => void) | undefined;
     let disposed = false;
     appWindow.onCloseRequested(async (event) => {
       event.preventDefault();
-      // 先等待防抖/兜底队列完成，确保最后一秒内的编辑也已进入恢复草稿。
+      // 等待防抖/兜底队列完成，确保最后一秒内的编辑也已进入恢复草稿。
       await recoveryFlushRef.current?.();
-      const dirtyIds = Array.from(useDocumentStore.getState().documents.values())
-        .filter((doc) => doc.isDirty)
-        .map((doc) => doc.id);
-      if (dirtyIds.length === 0) {
-        setClosingWindow(false);
-        await appWindow.destroy().catch(() => {});
-        return;
-      }
-      setClosingWindow(true);
-      setCloseQueue((queue) => Array.from(new Set([...queue, ...dirtyIds])));
+      setCloseQueue([]);
+      setClosingWindow(false);
+      // destroy 不会重新触发 close-requested，避免在关闭事件中调用 close() 导致重入。
+      await appWindow.destroy().catch((error) => {
+        console.error("关闭应用失败:", error);
+      });
     }).then((remove) => {
       if (disposed) remove();
       else unlisten = remove;
@@ -300,7 +296,9 @@ export default function App() {
   useEffect(() => {
     if (!closingWindow || closeQueue.length > 0) return;
     setClosingWindow(false);
-    getCurrentWindow().destroy().catch(() => {});
+    getCurrentWindow().destroy().catch((error) => {
+      console.error("关闭应用失败:", error);
+    });
   }, [closingWindow, closeQueue.length]);
 
   useEffect(() => {
@@ -342,10 +340,14 @@ export default function App() {
         if (!doc) return;
         if (doc.isDirty) {
           try {
+            const state = useDocumentStore.getState();
+            const tabOrder = Array.from(state.documents.keys()).indexOf(doc.id);
             await saveRecoveryDraft({
-              id: doc.id, path: doc.path, content: doc.content,
+              id: doc.id, path: doc.path, title: doc.title, content: doc.content,
               encoding: doc.encoding, line_ending: doc.lineEnding,
               language_id: doc.languageId, saved_at: Date.now(),
+              tab_order: tabOrder >= 0 ? tabOrder : undefined,
+              is_active: state.activeDocumentId === doc.id,
             });
             // 写入期间文档可能已被保存或关闭，避免旧写入把草稿重新留下。
             const current = useDocumentStore.getState().documents.get(id);
@@ -359,6 +361,7 @@ export default function App() {
         if (saveQueues.get(id) === next) saveQueues.delete(id);
       });
       saveQueues.set(id, next);
+      return next;
     };
 
     const scheduleDraftSave = (id: string) => {
@@ -421,31 +424,6 @@ export default function App() {
       recoveryFlushRef.current = null;
       for (const timer of debounceTimers.values()) clearTimeout(timer);
     };
-  }, []);
-
-  useEffect(() => {
-    (async () => {
-      try {
-        const drafts = await listRecoveryDrafts();
-        if (drafts.length > 0) {
-          for (const d of drafts) {
-            const doc: OpenDocument = {
-              id: d.id, path: d.path,
-              // 有路径的用文件名，无路径的按"新文件 N"顺序编号，与新建文件不重名
-              title: d.path ? d.path.split("\\").pop()?.split("/").pop() ?? nextUntitledTitle() : nextUntitledTitle(),
-              content: d.content, encoding: (d.encoding as TextEncoding) ?? "utf-8",
-              lineEnding: (d.line_ending as LineEnding) ?? "LF",
-              languageId: d.language_id || "plaintext", mode: "normal-edit",
-              isDirty: true, isReadonly: false, isUntitled: !d.path, lastSavedAt: d.saved_at,
-            };
-            useDocumentStore.getState().openDocument(doc);
-          }
-          // 草稿保留在磁盘上；5 秒自动保存会持续更新它们，
-          // 直到用户显式保存（markSaved）或关闭标签（closeDocument）时删除对应草稿。
-          useUIStore.getState().setStatusMessage(`已恢复 ${drafts.length} 个未保存文件`);
-        }
-      } catch { /* noop */ }
-    })();
   }, []);
 
   // Load recent files on startup
@@ -545,6 +523,50 @@ export default function App() {
         for (const path of startupPaths) {
           await handleOpenFileByPath(path);
         }
+      } catch { /* noop */ }
+
+      // 最后恢复未保存草稿。带路径的草稿覆盖会话中的同一标签，避免出现重复标签。
+      try {
+        const drafts = await listRecoveryDrafts();
+        let restoredCount = 0;
+        let restoredActiveId: string | null = null;
+        const restoredPositions: Array<{ id: string; order: number }> = [];
+        for (const d of drafts) {
+          const existingId = d.path ? findExistingDoc(d.path) : null;
+          if (existingId) {
+            const store = useDocumentStore.getState();
+            store.updateContent(existingId, d.content);
+            store.setEncoding(existingId, (d.encoding as TextEncoding) ?? "utf-8", false);
+            store.setLineEnding(existingId, (d.line_ending as LineEnding) ?? "LF", false);
+            if (d.language_id) store.setLanguage(existingId, d.language_id);
+            await clearRecoveryDraft(d.id).catch(() => {});
+            if (d.tab_order !== undefined) restoredPositions.push({ id: existingId, order: d.tab_order });
+            if (d.is_active) restoredActiveId = existingId;
+          } else {
+            const restoredTitle = d.title
+              ?? (d.path ? d.path.split("\\").pop()?.split("/").pop() : undefined)
+              ?? untitledTitleFromDocumentId(d.id)
+              ?? nextUntitledTitle();
+            if (!d.path) reserveUntitledTitle(restoredTitle);
+            const doc: OpenDocument = {
+              id: d.id, path: d.path,
+              title: restoredTitle,
+              content: d.content, encoding: (d.encoding as TextEncoding) ?? "utf-8",
+              lineEnding: (d.line_ending as LineEnding) ?? "LF",
+              languageId: d.language_id || "plaintext", mode: "normal-edit",
+              isDirty: true, isReadonly: false, isUntitled: !d.path, lastSavedAt: d.saved_at,
+            };
+            useDocumentStore.getState().openDocument(doc);
+            if (d.tab_order !== undefined) restoredPositions.push({ id: d.id, order: d.tab_order });
+            if (d.is_active) restoredActiveId = d.id;
+          }
+          restoredCount += 1;
+        }
+        restoredPositions
+          .sort((a, b) => a.order - b.order)
+          .forEach(({ id, order }) => useDocumentStore.getState().reorderDocuments(id, order));
+        if (restoredActiveId) useDocumentStore.getState().setActiveDocument(restoredActiveId);
+        if (restoredCount > 0) useUIStore.getState().setStatusMessage(`已恢复 ${restoredCount} 个未保存文件`);
       } catch { /* noop */ }
     })();
   }, [handleOpenFileByPath]);

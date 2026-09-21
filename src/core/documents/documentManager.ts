@@ -15,6 +15,18 @@ export function nextUntitledTitle(): string {
   return `新文件 ${nextId++}`;
 }
 
+/** Ensure newly-created documents do not reuse a restored untitled title. */
+export function reserveUntitledTitle(title: string): void {
+  const match = /^新文件 (\d+)$/.exec(title);
+  if (match) nextId = Math.max(nextId, Number(match[1]) + 1);
+}
+
+/** Recover the original untitled title used before drafts stored titles explicitly. */
+export function untitledTitleFromDocumentId(id: string): string | undefined {
+  const match = /^doc_(\d+)_\d+$/.exec(id);
+  return match ? `新文件 ${match[1]}` : undefined;
+}
+
 export function createUntitledDocument(): OpenDocument {
   return {
     id: generateDocumentId(),

@@ -8,11 +8,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub struct RecoveryDraft {
     pub id: String,
     pub path: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
     pub content: String,
     pub encoding: String,
     pub line_ending: String,
     pub language_id: String,
     pub saved_at: u64,
+    #[serde(default)]
+    pub tab_order: Option<usize>,
+    #[serde(default)]
+    pub is_active: bool,
 }
 
 fn recovery_dir() -> PathBuf {
@@ -31,6 +37,19 @@ fn recovery_dir() -> PathBuf {
     dir.push("recovery");
     let _ = std::fs::create_dir_all(&dir);
     dir
+}
+
+fn legacy_untitled_order(id: &str) -> Option<(u64, u64)> {
+    let mut parts = id.split('_');
+    if parts.next()? != "doc" {
+        return None;
+    }
+    let sequence = parts.next()?.parse().ok()?;
+    let created_at = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((created_at, sequence))
 }
 
 #[tauri::command]
@@ -157,8 +176,17 @@ pub fn list_recovery_drafts() -> Result<Vec<RecoveryDraft>, String> {
         }
     }
 
-    // Sort by saved_at descending
-    drafts.sort_by(|a, b| b.saved_at.cmp(&a.saved_at));
+    // New drafts retain their tab order. Legacy drafts without tab_order keep the
+    // previous saved-at ordering so existing recovery data remains compatible.
+    drafts.sort_by(|a, b| match (a.tab_order, b.tab_order) {
+        (Some(a_order), Some(b_order)) => a_order.cmp(&b_order),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => match (legacy_untitled_order(&a.id), legacy_untitled_order(&b.id)) {
+            (Some(a_order), Some(b_order)) => a_order.cmp(&b_order),
+            _ => b.saved_at.cmp(&a.saved_at),
+        },
+    });
 
     Ok(drafts)
 }
@@ -195,7 +223,11 @@ mod tests {
         let second = temporary_path(&target);
         assert_ne!(first, second);
         assert_eq!(first.parent(), target.parent());
-        assert!(first.file_name().unwrap().to_string_lossy().ends_with(".tmp"));
+        assert!(first
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .ends_with(".tmp"));
     }
 
     #[test]
@@ -203,16 +235,39 @@ mod tests {
         let draft = RecoveryDraft {
             id: "test".to_string(),
             path: Some("C:\\\\test.txt".to_string()),
+            title: Some("test.txt".to_string()),
             content: "draft".to_string(),
             encoding: "utf-8".to_string(),
             line_ending: "LF".to_string(),
             language_id: "plaintext".to_string(),
             saved_at: 42,
+            tab_order: Some(3),
+            is_active: true,
         };
         let json = serde_json::to_string(&draft).expect("draft should serialize");
-        let restored: RecoveryDraft = serde_json::from_str(&json).expect("draft should deserialize");
+        let restored: RecoveryDraft =
+            serde_json::from_str(&json).expect("draft should deserialize");
         assert_eq!(restored.id, draft.id);
         assert_eq!(restored.content, draft.content);
         assert_eq!(restored.saved_at, draft.saved_at);
+        assert_eq!(restored.title, draft.title);
+        assert_eq!(restored.tab_order, draft.tab_order);
+        assert_eq!(restored.is_active, draft.is_active);
+    }
+
+    #[test]
+    fn legacy_drafts_default_new_recovery_fields() {
+        let json = r#"{"id":"legacy","path":null,"content":"draft","encoding":"utf-8","line_ending":"LF","language_id":"plaintext","saved_at":42}"#;
+        let restored: RecoveryDraft =
+            serde_json::from_str(json).expect("legacy draft should deserialize");
+        assert_eq!(restored.title, None);
+        assert_eq!(restored.tab_order, None);
+        assert!(!restored.is_active);
+    }
+
+    #[test]
+    fn legacy_untitled_ids_expose_stable_creation_order() {
+        assert_eq!(legacy_untitled_order("doc_3_1000"), Some((1000, 3)));
+        assert_eq!(legacy_untitled_order("doc_1000"), None);
     }
 }

@@ -1546,7 +1546,7 @@ function EditorInstance({ docId, onContextMenu }: { docId: string; onContextMenu
     const view = viewRef.current;
     if (!view || !doc) return;
     const cur = view.state.doc.toString();
-    if (cur !== doc.content && !doc.isDirty) view.dispatch({ changes: { from: 0, to: cur.length, insert: doc.content } });
+    if (cur !== doc.content) view.dispatch({ changes: { from: 0, to: cur.length, insert: doc.content } });
   }, [doc?.content, doc?.isDirty]);
 
   // 切换主题时动态重配 CodeMirror 主题（保留撤销历史和光标位置）

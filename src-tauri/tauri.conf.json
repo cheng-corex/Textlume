@@ -42,13 +42,6 @@
         "description": "Textlume text document",
         "mimeType": "text/plain",
         "role": "Editor"
-      },
-      {
-        "ext": ["js", "jsx", "ts", "tsx", "html", "css", "py", "rs", "go", "java", "c", "cpp", "yaml", "yml", "xml", "sql"],
-        "name": "TextlumeCode",
-        "description": "Textlume source code document",
-        "mimeType": "text/plain",
-        "role": "Editor"
       }
     ]
   }
